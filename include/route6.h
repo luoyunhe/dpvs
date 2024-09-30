@@ -58,6 +58,8 @@ int route6_del(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flag
                const struct in6_addr *gw, struct netif_port *dev,
                const struct in6_addr *src, uint32_t mtu);
 
+int route6_flush(const struct netif_port *port);
+
 /* for route6_xxx.c only */
 void route6_free(struct route6*);
 

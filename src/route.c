@@ -254,7 +254,6 @@ static int route_add_lcore(nsid_t nsid, struct in_addr* dest,uint8_t netmask, ui
     if((flag & RTF_FORWARD) || (flag & RTF_DEFAULT))
         return route_net_add(nsid, dest, netmask, flag, gw,
                              port, src, mtu, metric);
-   
 
     return EDPVS_INVAL;
 }
@@ -434,35 +433,73 @@ struct route_entry *route4_output(nsid_t nsid, const struct flow4 *fl4)
     return NULL;
 }
 
-static int route_lcore_flush(void)
+static int route_lcore_flush(const struct netif_port *port)
 {
     int i = 0;
-    nsid_t nsid;
-    struct route_entry *route_node;
-    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++){
-        for (i = 0; i < LOCAL_ROUTE_TAB_SIZE; i++){
-            list_for_each_entry(route_node, &this_local_route_table(nsid)[i], list){
+    nsid_t nsid = port->nsid;
+    struct route_entry *route_node, *next;
+
+    for (i = 0; i < LOCAL_ROUTE_TAB_SIZE; i++){
+        list_for_each_entry_safe(route_node, next, &this_local_route_table(nsid)[i], list) {
+            if (!port || port->id == route_node->port->id) {
                 list_del(&route_node->list);
                 rte_atomic32_dec(&this_num_routes[nsid]);
                 route4_put(route_node);
             }
         }
+    }
 
-        list_for_each_entry(route_node, &this_net_route_table(nsid), list){
+    list_for_each_entry_safe(route_node, next, &this_net_route_table(nsid), list) {
+        if (!port || port->id == route_node->port->id) {
             list_del(&route_node->list);
             rte_atomic32_dec(&this_num_routes[nsid]);
             route4_put(route_node);
         }
     }
-    
+
     return EDPVS_OK;
 }
 
-int route_flush(void)
+static int route_flush_msg_cb(struct dpvs_msg *msg)
 {
-    return EDPVS_OK;
+    portid_t pid = *((uint16_t *)msg->data);
+    struct netif_port *port;
+
+    if (pid == NETIF_PORT_ID_INVALID)
+        return route_lcore_flush(NULL);
+
+    port = netif_port_get(pid);
+    if (!port) {
+        RTE_LOG(ERR, ROUTE, "%s: invalid port id %d\n", __func__, pid);
+        return EDPVS_NOTEXIST;
+    }
+    return route_lcore_flush(port);
 }
 
+int route_flush(const struct netif_port *port)
+{
+    int err;
+    portid_t pid;
+    struct dpvs_msg *msg;
+
+    // do it on master lcore
+    route_lcore_flush(port);
+
+    // do it on each slave lcore
+    if (port != NULL)
+        pid = port->id;
+    else
+        pid = NETIF_PORT_ID_INVALID;
+    msg = msg_make(MSG_TYPE_ROUTE_FLUSH, route_msg_seq(), DPVS_MSG_MULTICAST,
+            rte_lcore_id(), sizeof(pid), &pid);
+
+    err = multicast_msg_send(msg, DPVS_MSG_F_ASYNC, NULL);
+    if (err != EDPVS_OK)
+        RTE_LOG(INFO, ROUTE, "%s: fail to send route flush msg %d: %s\n",
+                __func__, MSG_TYPE_ROUTE_FLUSH, dpvs_strerror(err));
+    msg_destroy(&msg);
+    return EDPVS_OK;
+}
 
 /**
  * control plane
@@ -473,7 +510,7 @@ static int route_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
     struct dp_vs_route_detail *detail = (struct dp_vs_route_detail*)conf;
     struct netif_port *dev;
     union inet_addr *src, *dst, *gw;
-    uint32_t af, plen, metric, mtu; 
+    uint32_t af, plen, metric, mtu;
     uint32_t flags = 0;
     nsid_t nsid = detail->nsid;
 
@@ -705,7 +742,7 @@ static int route_lcore_term(void *arg)
     if (!rte_lcore_is_enabled(cid))
         return EDPVS_DISABLED;
 
-    return route_lcore_flush();
+    return route_lcore_flush(NULL);
 }
 
 int route_init(void)
@@ -745,6 +782,18 @@ int route_init(void)
     msg_type.prio   = MSG_PRIO_NORM;
     msg_type.cid    = rte_lcore_id();
     msg_type.unicast_msg_cb = route_del_msg_cb;
+    err = msg_type_mc_register(&msg_type);
+    if (err != EDPVS_OK) {
+        RTE_LOG(ERR, ROUTE, "%s: fail to register msg.\n", __func__);
+        return err;
+    }
+
+    memset(&msg_type, 0, sizeof(struct dpvs_msg_type));
+    msg_type.type   = MSG_TYPE_ROUTE_FLUSH;
+    msg_type.mode   = DPVS_MSG_MULTICAST;
+    msg_type.prio   = MSG_PRIO_NORM;
+    msg_type.cid    = rte_lcore_id();
+    msg_type.unicast_msg_cb = route_flush_msg_cb;
     err = msg_type_mc_register(&msg_type);
     if (err != EDPVS_OK) {
         RTE_LOG(ERR, ROUTE, "%s: fail to register msg.\n", __func__);
