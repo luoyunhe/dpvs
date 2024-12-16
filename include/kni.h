@@ -29,6 +29,7 @@
 #include <stdbool.h>
 #include "netif.h"
 #include "netif_flow.h"
+#include "rte_ethdev.h"
 
 #define MAX_KNI_FLOW    2
 
@@ -55,15 +56,11 @@ int kni_ctrl_term(void);
 
 static inline bool kni_dev_exist(const struct netif_port *dev)
 {
-    return dev->kni.kni ? true : false;
+    return false;
 }
 
 static inline void kni_handle_request(const struct netif_port *dev)
 {
-    if (!kni_dev_exist(dev))
-        return;
-
-    rte_kni_handle_request(dev->kni.kni);
 }
 
 #endif /* __DPVS_KNI_H__ */

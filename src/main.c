@@ -284,7 +284,8 @@ int main(int argc, char *argv[])
     struct timeval tv;
     char pql_conf_buf[LCORE_CONF_BUFFER_LEN];
     int pql_conf_buf_len = LCORE_CONF_BUFFER_LEN;
-
+    remove("/tmp/vhost-user0");
+    remove("/tmp/vhost-user1");
     dpdk_version_check();
 
     /**

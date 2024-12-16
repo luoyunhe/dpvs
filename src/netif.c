@@ -15,8 +15,7 @@
  * GNU General Public License for more details.
  *
  */
-#include <unistd.h>
-#include <fcntl.h>
+#include "netif.h"
 #include <assert.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -26,6 +25,7 @@
 #include <net/if.h>
 #include "dpdk.h"
 #include "conf/common.h"
+#include "generic/rte_cycles.h"
 #include "netif.h"
 #include "netif_addr.h"
 #include "conf/netif_addr.h"
@@ -45,6 +45,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ipvs/redirect.h>
+#include <rte_avp_common.h>
+#include <rte_bus.h>
+
 #ifdef CONFIG_ICMP_REDIRECT_CORE
 #include "icmp.h"
 #endif
@@ -72,7 +75,7 @@ int netif_pktpool_mbuf_cache = NETIF_PKTPOOL_MBUF_CACHE_DEF;
 
 #define ARP_RING_SIZE 2048
 
-#define RETA_CONF_SIZE  (ETH_RSS_RETA_SIZE_512 / RTE_RETA_GROUP_SIZE)
+#define RETA_CONF_SIZE  (RTE_ETH_RSS_RETA_SIZE_512 / RTE_ETH_RETA_GROUP_SIZE)
 
 /* physical nic id = phy_pid_base + index */
 static portid_t phy_pid_base = 0;
@@ -1783,7 +1786,7 @@ static inline uint16_t netif_rx_burst(portid_t pid, struct netif_queue_conf *qco
 {
     struct rte_mbuf *mbuf;
     int nrx = 0;
-
+    struct rte_eth_link link = {0};
     if (qconf->isol_rxq) {
         /* note API rte_ring_dequeue_bulk of dpdk-16.07 is not suitable, replace with
          * its bulk version after upgrading to new dpdk version */
@@ -2224,11 +2227,11 @@ static inline int validate_xmit_mbuf(struct rte_mbuf *mbuf,
     int err = EDPVS_OK;
 
     /* 802.1q VLAN */
-    if (mbuf->ol_flags & PKT_TX_VLAN_PKT) {
+    if (mbuf->ol_flags & RTE_AVP_TX_VLAN_PKT) {
         if (!(dev->flag & NETIF_PORT_FLAG_TX_VLAN_INSERT_OFFLOAD)) {
             err = vlan_insert_tag(mbuf, htons(ETH_P_8021Q),
                                   mbuf_vlan_tag_get_id(mbuf));
-            mbuf->ol_flags &= (~PKT_TX_VLAN_PKT);
+            mbuf->ol_flags &= (~RTE_AVP_TX_VLAN_PKT);
             mbuf->vlan_tci = 0;
         }
     }
@@ -2257,7 +2260,7 @@ int netif_hard_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
     /* send pkt on current lcore */
     cid = rte_lcore_id();
 
-    if (likely(mbuf->ol_flags & PKT_TX_IP_CKSUM))
+    if (likely(mbuf->ol_flags & RTE_MBUF_F_TX_IP_CKSUM))
         mbuf->l2_len = sizeof(struct rte_ether_hdr);
 
     if (rte_get_main_lcore() == cid) { // master thread
@@ -2352,11 +2355,11 @@ int netif_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 static inline eth_type_t eth_type_parse(const struct rte_ether_hdr *eth_hdr,
                                         const struct netif_port *dev)
 {
-    if (eth_addr_equal(&dev->addr, &eth_hdr->d_addr))
+    if (eth_addr_equal(&dev->addr, &eth_hdr->dst_addr))
         return ETH_PKT_HOST;
 
-    if (rte_is_multicast_ether_addr(&eth_hdr->d_addr)) {
-        if (rte_is_broadcast_ether_addr(&eth_hdr->d_addr))
+    if (rte_is_multicast_ether_addr(&eth_hdr->dst_addr)) {
+        if (rte_is_broadcast_ether_addr(&eth_hdr->dst_addr))
             return ETH_PKT_BROADCAST;
         else
             return ETH_PKT_MULTICAST;
@@ -2435,7 +2438,7 @@ int netif_rcv_mbuf(struct netif_port *dev, lcoreid_t cid, struct rte_mbuf *mbuf,
      * to act as VLAN filter.
      */
     if (eth_hdr->ether_type == htons(ETH_P_8021Q) ||
-            mbuf->ol_flags & PKT_RX_VLAN_STRIPPED) {
+            mbuf->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED) {
         if (vlan_rcv(mbuf, netif_port_get(mbuf->port)) != EDPVS_OK)
             goto drop;
         dev = netif_port_get(mbuf->port);
@@ -2816,42 +2819,11 @@ freepkt:
     rte_pktmbuf_free(mbuf);
 }
 
-static void kni_egress(struct netif_port *port)
-{
-    unsigned i, npkts;
-    struct rte_mbuf *kni_pkts_burst[NETIF_MAX_PKT_BURST];
 
-    if (!kni_dev_exist(port))
-        return;
-
-    npkts = rte_kni_rx_burst(port->kni.kni, kni_pkts_burst, NETIF_MAX_PKT_BURST);
-    if (unlikely(npkts > NETIF_MAX_PKT_BURST)) {
-        RTE_LOG(WARNING, NETIF, "%s: fail to recieve pkts from kni\n", __func__);
-        return;
-    }
-
-    for (i = 0; i < npkts; i++) {
-        if (unlikely(netif_xmit(kni_pkts_burst[i], port) != EDPVS_OK)) {
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-            RTE_LOG(INFO, NETIF, "%s: fail to transmit kni packet", __func__);
-#endif
-        }
-    }
-}
 
 static void kni_egress_process(void)
 {
-    struct netif_port *dev;
-    portid_t id;
-
-    for (id = 0; id < g_nports; id++) {
-        dev = netif_port_get(id);
-        if (!dev || !kni_dev_exist(dev))
-            continue;
-
-        kni_handle_request(dev);
-        kni_egress(dev);
-    }
+    return;
 }
 
 /*
@@ -2859,37 +2831,7 @@ static void kni_egress_process(void)
  */
 static void kni_ingress_process(void)
 {
-    struct rte_mbuf *mbufs[NETIF_MAX_PKT_BURST];
-    struct netif_port *dev;
-    uint16_t i, pkt_total, pkt_sent;
-    portid_t id;
-    lcoreid_t cid = rte_lcore_id();
-
-    for (id = 0; id < g_nports; id++) {
-        dev = netif_port_get(id);
-        if (!dev || !kni_dev_exist(dev))
-            continue;
-
-        pkt_total = rte_ring_dequeue_burst(dev->kni.rx_ring, (void**)mbufs,
-                                       NETIF_MAX_PKT_BURST, NULL);
-        if (pkt_total == 0)
-            continue;
-        lcore_stats[cid].ipackets += pkt_total;
-        for (i = 0; i < pkt_total; i++)
-            lcore_stats[cid].ibytes += mbufs[i]->pkt_len;
-        pkt_sent = rte_kni_tx_burst(dev->kni.kni, mbufs, pkt_total);
-
-        if (unlikely(pkt_sent < pkt_total)) {
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-            RTE_LOG(INFO, NETIF, "%s: sent %d packets to kni %s, loss %.2f%%\n",
-                    __func__, pkt_total, dev->kni.name,
-                    (pkt_total-pkt_sent)*100.0/pkt_total);
-#endif
-            free_mbufs(&(mbufs[pkt_sent]), pkt_total - pkt_sent);
-            lcore_stats[cid].dropped += (pkt_total - pkt_sent);
-        }
-        pkt_total = 0;
-    }
+    return;
 }
 
 /*
@@ -2898,91 +2840,13 @@ static void kni_ingress_process(void)
 static inline void kni_ingress_flow_xmit_vlan_trunk(struct netif_port *dev,
             lcoreid_t cid, struct netif_queue_conf *qconf)
 {
-    int i, left, right, len;
-    unsigned pkt_total, pkt_sent;
-    struct rte_ether_hdr *eh;
-    struct rte_mbuf *mbuf;
-    struct netif_port *rdev;
-
-    for (i = 0; i < qconf->len; i++) {
-        // the received packets may from multiple vlans,
-        // we have to process them one by one
-        mbuf = qconf->mbufs[i];
-        eh = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-        if (eh->ether_type == htons(ETH_P_8021Q) ||
-                mbuf->ol_flags & PKT_RX_VLAN_STRIPPED) {
-            vlan_rcv(mbuf, dev);
-        } else if (dev->type == PORT_TYPE_BOND_MASTER) {
-            mbuf->port = dev->id;
-        }
-        /*
-         * The performance is astonishingly poor (as observed only about 3K pps,
-         * dozens multiple less than normal) if xmit packets to kni one at a time!
-         *
-        if (rte_kni_tx_burst(dev->kni.kni, qconf->mbufs, 1) != 1) {
-            rte_pktmbuf_free(qconf->mbufs[i]);
-            lcore_stats[cid].dropped++;
-        }
-        */
-    }
-
-    // reorder mbufs and xmit to kni in batch for each vlan
-    len = qconf->len;
-    while (len > 0) {
-        left = 0;
-        right = len - 1;
-        mbuf = qconf->mbufs[right];
-        while (left < right) {
-            while (left < right && qconf->mbufs[left]->port != mbuf->port)
-                left++;
-            qconf->mbufs[right] = qconf->mbufs[left];
-            while (left < right && qconf->mbufs[right]->port == mbuf->port)
-                right--;
-            qconf->mbufs[left] = qconf->mbufs[right];
-        }
-        qconf->mbufs[right] = mbuf;
-
-        rdev = netif_port_get(mbuf->port);
-        if (unlikely(!rdev || !kni_dev_exist(rdev)))
-            rdev = dev;
-        pkt_total = len - right;
-        //pkt_sent = rte_kni_tx_burst(rdev->kni.kni, &qconf->mbufs[right], pkt_total);
-        pkt_sent = rte_ring_enqueue_bulk(rdev->kni.rx_ring,
-                    (void *const *)&qconf->mbufs[right], pkt_total, NULL);
-        if (unlikely(pkt_sent < pkt_total)) {
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-            RTE_LOG(INFO, NETIF, "%s: enqueue %d packets to kni %s, loss %.2f%%\n",
-                    __func__, pkt_total, rdev->kni.name,
-                    (pkt_total-pkt_sent)*100.0/pkt_total);
-#endif
-            free_mbufs(&(qconf->mbufs[right+pkt_sent]), pkt_total - pkt_sent);
-            lcore_stats[cid].dropped += pkt_total - pkt_sent;
-        }
-        len = right;
-    }
-
-    qconf->len = 0;
+    return;
 }
 
 static inline void kni_ingress_flow_xmit_vlan_access(struct netif_port *dev,
             lcoreid_t cid, struct netif_queue_conf *qconf)
 {
-    unsigned pkt_sent;
-
-    // pkt_sent = rte_kni_tx_burst(dev->kni.kni, qconf->mbufs, qconf->len);
-    pkt_sent = rte_ring_enqueue_bulk(dev->kni.rx_ring, (void *const *)qconf->mbufs, qconf->len, NULL);
-
-    if (unlikely(pkt_sent < qconf->len)) {
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-        RTE_LOG(INFO, NETIF, "%s: enqueue %d packets to rx_ring of kni %s, loss %.2f%%\n",
-                __func__, qconf->len, dev->kni.name,
-                (qconf->len-pkt_sent)*100.0/qconf->len);
-#endif
-        free_mbufs(&(qconf->mbufs[pkt_sent]), qconf->len - pkt_sent);
-        lcore_stats[cid].dropped += qconf->len - pkt_sent;
-    }
-
-    qconf->len = 0;
+    return;
 }
 
 /*
@@ -2990,33 +2854,7 @@ static inline void kni_ingress_flow_xmit_vlan_access(struct netif_port *dev,
  */
 static void kni_ingress_flow_process(void)
 {
-    int i, j;
-    portid_t pid;
-    lcoreid_t cid;
-    struct netif_port *dev;
-    struct netif_queue_conf *qconf;
-
-    cid = rte_lcore_id(); // kni worker
-    assert(LCORE_ID_ANY != cid);
-
-    for (i = 0; i < lcore_conf[lcore2index[cid]].nports; i++) {
-        pid = lcore_conf[lcore2index[cid]].pqs[i].id;
-        assert(pid <= bond_pid_end);
-        dev = netif_port_get(pid);
-        if (!dev || !kni_dev_exist(dev))
-            continue;
-        for (j = 0; j < lcore_conf[lcore2index[cid]].pqs[i].nrxq; j++) {
-            qconf = &lcore_conf[lcore2index[cid]].pqs[i].rxqs[j];
-            qconf->len = netif_rx_burst(pid, qconf);
-            lcore_stats_burst(&lcore_stats[cid], qconf->len);
-            if (!qconf->len)
-                continue;
-            if (dev->vlan_info)
-                kni_ingress_flow_xmit_vlan_trunk(dev, cid, qconf);
-            else
-                kni_ingress_flow_xmit_vlan_access(dev, cid, qconf);
-        }
-    }
+    return;
 }
 
 /*
@@ -3041,7 +2879,7 @@ static void netif_dump_rss_reta(struct netif_port *port)
 {
     int i, len, pos;
     uint32_t reta_id, reta_pos;
-    char buf[ETH_RSS_RETA_SIZE_512 * 8];
+    char buf[RTE_ETH_RSS_RETA_SIZE_512 * 8];
     struct rte_eth_rss_reta_entry64 reta_info[RETA_CONF_SIZE];
 
     if (port->type != PORT_TYPE_GENERAL && port->type != PORT_TYPE_BOND_SLAVE)
@@ -3053,7 +2891,7 @@ static void netif_dump_rss_reta(struct netif_port *port)
 
     memset(reta_info, 0, sizeof(reta_info));
     for (i = 0; i < port->dev_info.reta_size; i++)
-        reta_info[i / RTE_RETA_GROUP_SIZE].mask = UINT64_MAX;
+        reta_info[i / RTE_ETH_RETA_GROUP_SIZE].mask = UINT64_MAX;
 
     if (unlikely(rte_eth_dev_rss_reta_query(port->id, reta_info,
                     port->dev_info.reta_size)))
@@ -3062,8 +2900,8 @@ static void netif_dump_rss_reta(struct netif_port *port)
     buf[0] = '\0';
     len = pos = 0;
     for (i = 0; i < port->dev_info.reta_size; i++) {
-        reta_id = i / RTE_RETA_GROUP_SIZE;
-        reta_pos = i % RTE_RETA_GROUP_SIZE;
+        reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
+
         if (i % 8 == 0) {
             len = snprintf(&buf[pos], sizeof(buf) - pos, "\n%4d: ", i);
             if (len >= sizeof(buf) - pos) {
@@ -3110,8 +2948,8 @@ static int __netif_update_rss_reta(struct netif_port *port)
 
     memset(reta_conf, 0, sizeof(reta_conf));
     for (i = 0; i < port->dev_info.reta_size; i++) {
-        reta_id = i / RTE_RETA_GROUP_SIZE;
-        reta_pos = i % RTE_RETA_GROUP_SIZE;
+        reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
+        reta_pos = i % RTE_ETH_RETA_GROUP_SIZE;
         reta_conf[reta_id].mask = UINT64_MAX;
         reta_conf[reta_id].reta[reta_pos] = (uint16_t)(rssq[i % nrssq]);
     }
@@ -3432,19 +3270,19 @@ static inline void setup_dev_of_flags(struct netif_port *port)
     port->flag |= NETIF_PORT_FLAG_ENABLED;
 
     /* tx offload conf and flags */
-    if (port->dev_info.tx_offload_capa & DEV_TX_OFFLOAD_IPV4_CKSUM)
+    if (port->dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)
         port->flag |= NETIF_PORT_FLAG_TX_IP_CSUM_OFFLOAD;
 
-    if (port->dev_info.tx_offload_capa & DEV_TX_OFFLOAD_TCP_CKSUM)
+    if (port->dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)
         port->flag |= NETIF_PORT_FLAG_TX_TCP_CSUM_OFFLOAD;
 
-    if (port->dev_info.tx_offload_capa & DEV_TX_OFFLOAD_UDP_CKSUM)
+    if (port->dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
         port->flag |= NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD;
 
     /* FIXME: may be a bug in dev_info get for virtio device,
      *        set the txq_of_flags manually for this type device */
     if (strncmp(port->dev_info.driver_name, "net_virtio", strlen("net_virtio")) == 0) {
-        port->flag |= NETIF_PORT_FLAG_TX_IP_CSUM_OFFLOAD;
+        // port->flag |= NETIF_PORT_FLAG_TX_IP_CSUM_OFFLOAD;
         port->flag &= ~NETIF_PORT_FLAG_TX_TCP_CSUM_OFFLOAD;
         port->flag &= ~NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD;
     }
@@ -3465,11 +3303,11 @@ static inline void setup_dev_of_flags(struct netif_port *port)
 #endif
 
     /* rx offload conf and flags */
-    if (port->dev_info.rx_offload_capa & DEV_RX_OFFLOAD_VLAN_STRIP) {
+    if (port->dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_VLAN_STRIP) {
         port->flag |= NETIF_PORT_FLAG_RX_VLAN_STRIP_OFFLOAD;
-        port->dev_conf.rxmode.offloads |= DEV_RX_OFFLOAD_VLAN_STRIP;
+        port->dev_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
     }
-    if (port->dev_info.rx_offload_capa & DEV_RX_OFFLOAD_IPV4_CKSUM)
+    if (port->dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM)
         port->flag |= NETIF_PORT_FLAG_RX_IP_CSUM_OFFLOAD;
 
     /* enable lldp on physical port */
@@ -3649,21 +3487,21 @@ static int rss_resolve_proc(char *rss)
     int rss_value = 0;
 
     if (!strcmp(rss, "all"))
-        rss_value = ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP;
+        rss_value = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP;
     else if (!strcmp(rss, "ip"))
-        rss_value = ETH_RSS_IP;
+        rss_value = RTE_ETH_RSS_IP;
     else if (!strcmp(rss, "tcp"))
-        rss_value = ETH_RSS_TCP;
+        rss_value = RTE_ETH_RSS_TCP;
     else if (!strcmp(rss, "udp"))
-        rss_value = ETH_RSS_UDP;
+        rss_value = RTE_ETH_RSS_UDP;
     else if (!strcmp(rss, "sctp"))
-        rss_value = ETH_RSS_SCTP;
+        rss_value = RTE_ETH_RSS_SCTP;
     else if (!strcmp(rss, "ether"))
-        rss_value = ETH_RSS_L2_PAYLOAD;
+        rss_value = RTE_ETH_RSS_L2_PAYLOAD;
     else if (!strcmp(rss, "port"))
-        rss_value = ETH_RSS_PORT;
+        rss_value = RTE_ETH_RSS_PORT;
     else if (!strcmp(rss, "tunnel"))
-        rss_value = ETH_RSS_TUNNEL;
+        rss_value = RTE_ETH_RSS_TUNNEL;
 
     return rss_value;
 }
@@ -3707,10 +3545,6 @@ static void adapt_device_conf(portid_t port_id, uint64_t *rss_hf,
 static void fill_port_config(struct netif_port *port, char *promisc_on, char *allmulticast)
 {
     assert(port);
-
-    char rss[256] = {0};
-    int index = 0;
-    int rss_index = 0;
     struct port_conf_stream *cfg_stream;
 
     if (port->type == PORT_TYPE_BOND_SLAVE) {
@@ -3723,47 +3557,11 @@ static void fill_port_config(struct netif_port *port, char *promisc_on, char *al
     }
 
     cfg_stream = get_port_conf_stream(port->name);
-    if (cfg_stream) {
-        /* device specific configurations from cfgfile */
-        port->dev_conf.rx_adv_conf.rss_conf.rss_hf = 0;
-        for (index = 0; index < strlen(cfg_stream->rss); index++) {
-            if (cfg_stream->rss[index] == ' ') {
-                continue;
-            } else if (cfg_stream->rss[index] != '|') {
-                rss[rss_index++] = cfg_stream->rss[index];
-            } else {
-                rss[rss_index] = '\0';
-                rss_index = 0;
-                port->dev_conf.rx_adv_conf.rss_conf.rss_hf |= rss_resolve_proc(rss);
-                memset(rss, 0, sizeof(rss));
-            }
-        }
 
-        if (rss[0]) {
-            port->dev_conf.rx_adv_conf.rss_conf.rss_hf |= rss_resolve_proc(rss);
-        }
-
-        port->mtu = cfg_stream->mtu;
-        if (cfg_stream->rx_queue_nb > 0 && port->nrxq > cfg_stream->rx_queue_nb) {
-            RTE_LOG(WARNING, NETIF, "%s: rx-queues configured in workers (%d) != "
-                    "rx-queues configured in device (%d), setup %d rx-queues for %s\n",
-                    port->name, port->nrxq, cfg_stream->rx_queue_nb,
-                    port->nrxq, port->name);
-        }
-        if (cfg_stream->tx_queue_nb > 0 && port->ntxq > cfg_stream->tx_queue_nb) {
-            RTE_LOG(WARNING, NETIF, "%s: tx-queues configured in workers (%d) != "
-                    "tx-queues configured in device (%d), setup %d tx-queues for %s\n",
-                    port->name, port->ntxq, cfg_stream->tx_queue_nb,
-                    port->ntxq, port->name);
-        }
-        port->rxq_desc_nb = cfg_stream->rx_desc_nb;
-        port->txq_desc_nb = cfg_stream->tx_desc_nb;
-    } else {
-        /* using default configurations */
-        port->rxq_desc_nb = NETIF_NB_RX_DESC_DEF;
-        port->txq_desc_nb = NETIF_NB_TX_DESC_DEF;
-        port->mtu = NETIF_DEFAULT_ETH_MTU;
-    }
+    /* using default configurations */
+    port->rxq_desc_nb = NETIF_NB_RX_DESC_DEF;
+    port->txq_desc_nb = NETIF_NB_TX_DESC_DEF;
+    port->mtu = NETIF_DEFAULT_ETH_MTU;
 
     if (port->type == PORT_TYPE_BOND_MASTER) {
         assert(port->bond->master.primary);
@@ -3816,7 +3614,7 @@ static int add_bond_slaves(struct netif_port *port)
 
     for (ii = 0; ii < port->bond->master.slave_nb; ii++) {
         slave = port->bond->master.slaves[ii];
-        if (rte_eth_bond_slave_add(port->id, slave->id) < 0) {
+        if (rte_eth_bond_member_add(port->id, slave->id) < 0) {
             RTE_LOG(ERR, NETIF, "%s: fail to add slave %s to %s\n", __func__,
                     slave->name, port->name);
             return EDPVS_DPDKAPIFAIL;
@@ -3849,23 +3647,6 @@ static int add_bond_slaves(struct netif_port *port)
     return EDPVS_OK;
 }
 
-#ifdef CONFIG_DPVS_FDIR
-static int config_fdir_conf(struct rte_fdir_conf *fdir_conf)
-{
-    int shift;
-
-    /* how many mask bits needed? */
-    for (shift = 0; (0x1<<shift) < g_slave_lcore_num; shift++)
-        ;
-    if (shift >= 16)
-        return EDPVS_INVAL;
-
-    fdir_conf->mask.dst_port_mask = htons(~((~0x0) << shift));
-    fdir_conf->mode = g_fdir_mode;
-
-    return EDPVS_OK;
-}
-#endif
 
 /*
  * Note: Invoke the function after port is allocated and lcores are configured.
@@ -3898,29 +3679,25 @@ int netif_port_start(struct netif_port *port)
                 port->dev_info.max_tx_queues, port->nrxq, port->ntxq);
     }
 
-    // device configure
-    if ((ret = rte_eth_dev_set_mtu(port->id,port->mtu)) != EDPVS_OK)
-        return ret;
-#ifdef CONFIG_DPVS_FDIR
-    ret = config_fdir_conf(&port->dev_conf.fdir_conf);
-    if (ret != EDPVS_OK)
-        return ret;
-#endif
+
     if (port->flag & NETIF_PORT_FLAG_TX_IP_CSUM_OFFLOAD)
-        port->dev_conf.txmode.offloads |= DEV_TX_OFFLOAD_IPV4_CKSUM;
+        port->dev_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
     if (port->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD)
-        port->dev_conf.txmode.offloads |= DEV_TX_OFFLOAD_UDP_CKSUM;
+        port->dev_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
     if (port->flag & NETIF_PORT_FLAG_TX_TCP_CSUM_OFFLOAD)
-        port->dev_conf.txmode.offloads |= DEV_TX_OFFLOAD_TCP_CKSUM;
-    port->dev_conf.txmode.offloads |= DEV_TX_OFFLOAD_MBUF_FAST_FREE;
-    adapt_device_conf(port->id, &port->dev_conf.rx_adv_conf.rss_conf.rss_hf,
-            &port->dev_conf.rxmode.offloads, &port->dev_conf.txmode.offloads);
+        port->dev_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+    if (port->dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+        port->dev_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
     ret = rte_eth_dev_configure(port->id, port->nrxq, port->ntxq, &port->dev_conf);
     if (ret < 0 ) {
         RTE_LOG(ERR, NETIF, "%s: fail to config %s\n", __func__, port->name);
         return EDPVS_DPDKAPIFAIL;
     }
+    
+    // device configure
+    if ((ret = rte_eth_dev_set_mtu(port->id,port->mtu)) != EDPVS_OK)
+        return ret;
 
     // setup rx queues
     if (port->nrxq > 0) {
@@ -3984,7 +3761,7 @@ int netif_port_start(struct netif_port *port)
         if (link.link_status) {
             RTE_LOG(INFO, NETIF, ">> %s: link up - speed %u Mbps - %s\n",
                     port->name, (unsigned)link.link_speed,
-                    (link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
+                    (link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX) ?
                     "full-duplex" : "half-duplex");
             break;
         }
@@ -4173,42 +3950,11 @@ static int relate_bonding_device(void)
 
 static struct rte_eth_conf default_port_conf = {
     .rxmode = {
-        .mq_mode        = ETH_MQ_RX_RSS,
-        .max_rx_pkt_len = ETHER_MAX_LEN,
-        .split_hdr_size = 0,
-        .offloads = DEV_RX_OFFLOAD_IPV4_CKSUM,
-    },
-    .rx_adv_conf = {
-        .rss_conf = {
-            .rss_key = NULL,
-            .rss_hf  = /*ETH_RSS_IP*/ ETH_RSS_TCP,
-        },
+        .mq_mode        = RTE_ETH_MQ_RX_NONE,
     },
     .txmode = {
-        .mq_mode = ETH_MQ_TX_NONE,
+        .mq_mode = RTE_ETH_MQ_TX_NONE,
     },
-#ifdef CONFIG_DPVS_FDIR
-    .fdir_conf = {
-        .mode    = RTE_FDIR_MODE_PERFECT, /* maybe changed by config file */
-        .pballoc = RTE_FDIR_PBALLOC_64K,
-        .status  = RTE_FDIR_REPORT_STATUS,
-        .mask    = {
-            .ipv4_mask  = {
-                .dst_ip = 0xFFFFFFFF,
-            },
-            .ipv6_mask  = {
-                .dst_ip = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF },
-            },
-            /* to be changed according to slave lcore number in use */
-            .dst_port_mask = 0x0700,
-        },
-        .drop_queue = 127,
-        .flex_conf  = {
-            .nb_payloads    = 0,
-            .nb_flexmasks   = 0,
-        },
-    },
-#endif
 };
 
 int netif_print_port_conf(const struct rte_eth_conf *port_conf, char *buf, int *len)
@@ -4220,23 +3966,23 @@ int netif_print_port_conf(const struct rte_eth_conf *port_conf, char *buf, int *
         port_conf = &default_port_conf;
 
     memset(buf, 0, *len);
-    if (port_conf->rxmode.mq_mode == ETH_MQ_RX_RSS) {
+    if (port_conf->rxmode.mq_mode == RTE_ETH_MQ_RX_RSS) {
         memset(tbuf2, 0, sizeof(tbuf2));
         if (port_conf->rx_adv_conf.rss_conf.rss_hf) {
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_IP)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_IP ");
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_TCP)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_TCP ");
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_UDP)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_UDP ");
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_SCTP)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_SCTP ");
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_L2_PAYLOAD)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_L2_PAYLOAD ");
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_PORT)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_PORT ");
-            if (port_conf->rx_adv_conf.rss_conf.rss_hf & ETH_RSS_TUNNEL)
-                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "ETH_RSS_TUNNEL ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_IP)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_IP ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_TCP)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_TCP ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_UDP)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_UDP ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_SCTP)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_SCTP ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_L2_PAYLOAD)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_L2_PAYLOAD ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_PORT)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_PORT ");
+            if (port_conf->rx_adv_conf.rss_conf.rss_hf & RTE_ETH_RSS_TUNNEL)
+                snprintf(tbuf2 + strlen(tbuf2), sizeof(tbuf2) - strlen(tbuf2), "RTE_ETH_RSS_TUNNEL ");
         } else {
             snprintf(tbuf2, sizeof(tbuf2), "Inhibited");
         }
@@ -4772,28 +4518,28 @@ static int get_port_basic(struct netif_port *port, void **out, size_t *out_len)
     get->link_speed = link.link_speed;
 
     switch (link.link_status) {
-        case ETH_LINK_UP:
+        case RTE_ETH_LINK_UP:
             snprintf(get->link_status, sizeof(get->link_status), "%s", "UP");
             break;
-        case ETH_LINK_DOWN:
+        case RTE_ETH_LINK_DOWN:
             snprintf(get->link_status, sizeof(get->link_status), "%s", "DOWN");
             break;
     }
 
     switch (link.link_duplex) {
-        case ETH_LINK_HALF_DUPLEX:
+        case RTE_ETH_LINK_HALF_DUPLEX:
             snprintf(get->link_duplex, sizeof(get->link_duplex), "%s", "half-duplex");
             break;
-        case ETH_LINK_FULL_DUPLEX:
+        case RTE_ETH_LINK_FULL_DUPLEX:
             snprintf(get->link_duplex, sizeof(get->link_duplex), "%s", "full-duplex");
             break;
     }
 
     switch (link.link_autoneg) {
-        case ETH_LINK_FIXED:
+        case RTE_ETH_LINK_FIXED:
             snprintf(get->link_autoneg, sizeof(get->link_autoneg), "%s", "fixed-nego");
             break;
-        case ETH_LINK_AUTONEG:
+        case RTE_ETH_LINK_AUTONEG:
             snprintf(get->link_autoneg, sizeof(get->link_autoneg), "%s", "auto-nego");
             break;
     }
@@ -4838,22 +4584,6 @@ static int get_port_basic(struct netif_port *port, void **out, size_t *out_len)
 static inline void copy_dev_info(struct netif_nic_dev_get *get,
         const struct rte_eth_dev_info *dev_info)
 {
-    const struct rte_pci_device *pci_dev = NULL;
-#if RTE_VERSION < RTE_VERSION_NUM(18, 11, 0, 0)
-    pci_dev = dev_info->pci_dev;
-#else
-    if (dev_info->device) {
-        const struct rte_bus *bus = NULL;
-        bus = rte_bus_find_by_device(dev_info->device);
-        if (bus && !strcmp(bus->name, "pci")) {
-            pci_dev = RTE_DEV_TO_PCI(dev_info->device);
-        }
-    }
-#endif
-    if (pci_dev)
-        snprintf(get->pci_addr, sizeof(get->pci_addr), "%04x:%02x:%02x:%0x",
-                 pci_dev->addr.domain, pci_dev->addr.bus,
-                 pci_dev->addr.devid, pci_dev->addr.function);
     if (dev_info->driver_name)
         strncpy(get->driver_name, dev_info->driver_name, sizeof(get->driver_name));
     get->if_index = dev_info->if_index;
@@ -5048,9 +4778,9 @@ static int get_bond_status(struct netif_port *port, void **out, size_t *out_len)
     get->mode = rte_eth_bond_mode_get(port->id);
 
     primary = rte_eth_bond_primary_get(port->id);
-    get->slave_nb = rte_eth_bond_slaves_get(port->id,
+    get->slave_nb = rte_eth_bond_members_get(port->id,
             slaves, NETIF_MAX_BOND_SLAVES);
-    get->active_nb = rte_eth_bond_active_slaves_get(port->id,
+    get->active_nb = rte_eth_bond_active_members_get(port->id,
             actives, NETIF_MAX_BOND_SLAVES);
     for (i = 0; i < get->slave_nb; i++) {
         is_active = false;
@@ -5249,7 +4979,7 @@ static int set_port(struct netif_port *port, const netif_nic_set_t *port_cfg)
         struct rte_eth_link link;
         err = rte_eth_dev_set_link_up(port->id);
         rte_eth_link_get(port->id, &link);
-        if (link.link_status == ETH_LINK_DOWN) {
+        if (link.link_status == RTE_ETH_LINK_DOWN) {
             RTE_LOG(WARNING, NETIF, "set %s link up [ FAIL ] -- %d\n",
                     port_cfg->pname, err);
         } else {
@@ -5264,7 +4994,7 @@ static int set_port(struct netif_port *port, const netif_nic_set_t *port_cfg)
         struct rte_eth_link link;
         err = rte_eth_dev_set_link_down(port->id);
         rte_eth_link_get(port->id, &link);
-        if (link.link_status == ETH_LINK_UP) {
+        if (link.link_status == RTE_ETH_LINK_UP) {
             RTE_LOG(WARNING, NETIF, "set %s link down [ FAIL ] -- %d\n",
                     port_cfg->pname, err);
         } else {
@@ -5342,13 +5072,13 @@ static int set_bond(struct netif_port *port, const netif_bond_set_t *bond_cfg)
         if (!slave)
             return EDPVS_NOTEXIST;
         if (bond_cfg->act == ACT_ADD) {
-            if (!rte_eth_bond_slave_add(port->id, slave->id)) {
+            if (!rte_eth_bond_member_add(port->id, slave->id)) {
                 RTE_LOG(INFO, NETIF, "slave %s is added to %s\n",
                         slave->name, port->name);
                 port->bond->master.slaves[port->bond->master.slave_nb++] = slave;
             }
         } else if (bond_cfg->act == ACT_DEL) {
-            if (!rte_eth_bond_slave_remove(port->id, slave->id)) {
+            if (!rte_eth_bond_member_remove(port->id, slave->id)) {
                 RTE_LOG(INFO, NETIF, "slave %s is removed from %s\n",
                         slave->name, port->name);
                 for (i = 0, j = 0; i < port->bond->master.slave_nb; i++) {

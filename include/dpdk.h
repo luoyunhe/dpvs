@@ -53,11 +53,9 @@
 #include <rte_rwlock.h>
 #include <rte_timer.h>
 #include <rte_jhash.h>
-#include <rte_kni.h>
 #include <rte_ip_frag.h>
 #include <rte_eth_bond.h>
 #include <rte_eth_bond_8023ad.h>
-#include <rte_ethdev_driver.h>
 #include "mbuf.h"
 #ifdef CONFIG_DPVS_PDUMP
 #include <rte_pdump.h>
