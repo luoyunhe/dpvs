@@ -605,7 +605,7 @@ static int lldp_local_pdu_port_desc(const struct netif_port *dev, uint32_t subty
     char desc[128];
 
     desc_len = snprintf(desc, sizeof(desc), "DPVS Server Port: Interface %s, Index %d, Kni %s",
-            dev->name, dev->id, dev->kni.kni ? dev->kni.name : "None");
+            dev->name, dev->id, dev->kni.port_id ? dev->kni.name : "None");
     if (2 + desc_len <= len) {
         *((uint16_t *)buf) = DPVS_LLDP_TL(LLDP_TYPE_PORT_DESC, desc_len);
         rte_memcpy(&buf[2], desc, desc_len);
@@ -849,7 +849,7 @@ static int lldp_local_pdu_mng_addr(const struct netif_port *dev, uint32_t subtyp
             break;
         case LLDP_ADDR_IPV4:
             *ptr = 5;
-            rc = get_host_addr(dev->kni.kni ? dev->kni.name : NULL, &addr, NULL, ifname, NULL);
+            rc = get_host_addr(dev->kni.port_id ? dev->kni.name : NULL, &addr, NULL, ifname, NULL);
             if (rc < 0)
                 return rc;
             if (rc & 0x1)
@@ -860,7 +860,7 @@ static int lldp_local_pdu_mng_addr(const struct netif_port *dev, uint32_t subtyp
             break;
         case LLDP_ADDR_IPV6:
             *ptr = 17;
-            rc = get_host_addr(dev->kni.kni ? dev->kni.name : NULL, NULL, &addr, NULL, ifname);
+            rc = get_host_addr(dev->kni.port_id ? dev->kni.name : NULL, NULL, &addr, NULL, ifname);
             if (rc < 0)
                 return rc;
             if (rc &0x2)

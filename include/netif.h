@@ -19,6 +19,7 @@
 #define __DPVS_NETIF_H__
 #include <net/if.h>
 #include <net/ethernet.h>
+#include <stdint.h>
 #include "list.h"
 #include "dpdk.h"
 #include "inetaddr.h"
@@ -171,7 +172,7 @@ typedef enum {
 
 struct netif_kni {
     char                    name[IFNAMSIZ];
-    struct rte_kni          *kni;
+    uint16_t                port_id; 
     struct rte_ether_addr   addr;
     struct dpvs_timer       kni_rtnl_timer;
     int                     kni_rtnl_fd;

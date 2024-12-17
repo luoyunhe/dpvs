@@ -56,11 +56,7 @@ int kni_ctrl_term(void);
 
 static inline bool kni_dev_exist(const struct netif_port *dev)
 {
-    return false;
-}
-
-static inline void kni_handle_request(const struct netif_port *dev)
-{
+    return dev->kni.port_id ? true : false;
 }
 
 #endif /* __DPVS_KNI_H__ */

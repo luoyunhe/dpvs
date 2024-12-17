@@ -2819,10 +2819,41 @@ freepkt:
     rte_pktmbuf_free(mbuf);
 }
 
+static void kni_egress(struct netif_port *port)
+{
+    unsigned i, npkts;
+    struct rte_mbuf *kni_pkts_burst[NETIF_MAX_PKT_BURST];
 
+    if (!kni_dev_exist(port))
+        return;
+
+    npkts = rte_eth_rx_burst(port->kni.port_id, 0, kni_pkts_burst, NETIF_MAX_PKT_BURST);
+    if (unlikely(npkts > NETIF_MAX_PKT_BURST)) {
+        RTE_LOG(WARNING, NETIF, "%s: fail to recieve pkts from kni\n", __func__);
+        return;
+    }
+
+    for (i = 0; i < npkts; i++) {
+        if (unlikely(netif_xmit(kni_pkts_burst[i], port) != EDPVS_OK)) {
+#ifdef CONFIG_DPVS_NETIF_DEBUG
+            RTE_LOG(INFO, NETIF, "%s: fail to transmit kni packet", __func__);
+#endif
+        }
+    }
+}
 
 static void kni_egress_process(void)
 {
+    struct netif_port *dev;
+    portid_t id;
+
+    for (id = 0; id < g_nports; id++) {
+        dev = netif_port_get(id);
+        if (!dev || !kni_dev_exist(dev))
+            continue;
+
+        kni_egress(dev);
+    }
     return;
 }
 
@@ -2831,6 +2862,36 @@ static void kni_egress_process(void)
  */
 static void kni_ingress_process(void)
 {
+    struct rte_mbuf *mbufs[NETIF_MAX_PKT_BURST];
+    struct netif_port *dev;
+    uint16_t i, pkt_total, pkt_sent;
+    portid_t id;
+    lcoreid_t cid = rte_lcore_id();
+    for (id = 0; id < g_nports; id++) {
+        dev = netif_port_get(id);
+        if (!dev || !kni_dev_exist(dev))
+            continue;
+
+        pkt_total = rte_ring_dequeue_burst(dev->kni.rx_ring, (void**)mbufs,
+                                       NETIF_MAX_PKT_BURST, NULL);
+        if (pkt_total == 0)
+            continue;
+        lcore_stats[cid].ipackets += pkt_total;
+        for (i = 0; i < pkt_total; i++)
+            lcore_stats[cid].ibytes += mbufs[i]->pkt_len;
+        pkt_sent = rte_eth_tx_burst(dev->kni.port_id, 0, mbufs, pkt_total);
+
+        if (unlikely(pkt_sent < pkt_total)) {
+#ifdef CONFIG_DPVS_NETIF_DEBUG
+            RTE_LOG(INFO, NETIF, "%s: sent %d packets to kni %s, loss %.2f%%\n",
+                    __func__, pkt_total, dev->kni.name,
+                    (pkt_total-pkt_sent)*100.0/pkt_total);
+#endif
+            free_mbufs(&(mbufs[pkt_sent]), pkt_total - pkt_sent);
+            lcore_stats[cid].dropped += (pkt_total - pkt_sent);
+        }
+        pkt_total = 0;
+    }   
     return;
 }
 
