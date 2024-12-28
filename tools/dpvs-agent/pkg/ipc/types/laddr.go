@@ -40,7 +40,8 @@ type LocalAddrFront struct {
 	count  uint32
 	addr   [0x10]byte
 	match  dpvsMatch
-	nop    uint32
+	nsid   uint8
+	nop    [3]uint8
 }
 
 func NewLocalAddrFront() *LocalAddrFront {

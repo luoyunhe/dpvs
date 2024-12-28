@@ -78,6 +78,10 @@ typedef uint32_t    __u32;
 typedef uint8_t lcoreid_t;
 #endif
 
+#ifndef nsid_t
+typedef uint8_t nsid_t;
+#endif
+
 #ifndef portid_t
 typedef uint16_t portid_t;
 #endif
@@ -203,5 +207,5 @@ int mask2prefix(const struct sockaddr *addr);
  * */
 int get_host_addr(const char *ifname, struct sockaddr_storage *result4,
         struct sockaddr_storage *result6, char *ifname4, char *ifname6);
-
+#define DPVS_RT6_DEBUG
 #endif /* __DPVS_COMMON_H__ */

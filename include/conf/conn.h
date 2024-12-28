@@ -19,6 +19,7 @@
 #ifndef __DPVS_CONN_CONF_H__
 #define __DPVS_CONN_CONF_H__
 
+#include "conf/common.h"
 #include "list.h"
 #include "inet.h"
 #include "conf/sockopts.h"
@@ -101,6 +102,7 @@ struct ip_vs_conn_entry {
 typedef struct ip_vs_conn_entry ipvs_conn_entry_t;
 
 struct ip_vs_conn_req {
+    nsid_t nsid;
     uint32_t flag;
     uint32_t whence;
     ipvs_sockpair_t sockpair;

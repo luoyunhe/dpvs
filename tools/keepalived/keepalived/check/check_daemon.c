@@ -479,8 +479,9 @@ sigusr1_check(__attribute__((unused)) void *v, __attribute__((unused)) int sig)
 }
 
 static void
-sigreload_check(__attribute__((unused)) void *v, __attribute__((unused)) int sig)
+sigreload_check(void *v, __attribute__((unused)) int sig)
 {
+	nsid_t nsid = *(nsid_t*)v;
 	thread_add_event(master, reload_check_thread, NULL, 0);
 }
 

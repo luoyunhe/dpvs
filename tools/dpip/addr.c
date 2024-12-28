@@ -223,7 +223,7 @@ static int addr_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
 
     if (addr_parse_args(conf, &param) != 0)
         return EDPVS_INVAL;
-
+    param.nsid = g_nsid;
     switch (conf->cmd) {
     case DPIP_CMD_ADD:
         param.ifa_ops = INET_ADDR_ADD;

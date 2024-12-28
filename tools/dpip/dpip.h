@@ -17,6 +17,7 @@
  */
 #ifndef __DPIP_H__
 #define __DPIP_H__
+#include "conf/common.h"
 #include "list.h"
 #include "utils.h"
 
@@ -71,5 +72,7 @@ struct dpip_obj {
 
 void dpip_register_obj(struct dpip_obj *obj);
 void dpip_unregister_obj(struct dpip_obj *obj);
+
+extern nsid_t g_nsid;
 
 #endif

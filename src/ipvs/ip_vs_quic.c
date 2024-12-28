@@ -16,6 +16,7 @@
  *
  */
 
+#include "conf/common.h"
 #include "ipvs/quic.h"
 #include "ipvs/conn.h"
 
@@ -196,7 +197,7 @@ int quic_parse_server(const struct rte_mbuf *mbuf,
     return EDPVS_OK;
 }
 
-struct dp_vs_conn* quic_schedule(const struct dp_vs_service *svc,
+struct dp_vs_conn* quic_schedule(nsid_t nsid, const struct dp_vs_service *svc,
         const struct quic_server *qsvr,
         const struct dp_vs_iphdr *iph,
         struct rte_mbuf *mbuf) {
@@ -231,7 +232,7 @@ struct dp_vs_conn* quic_schedule(const struct dp_vs_service *svc,
     if (svc->flags & DP_VS_SVC_F_EXPIRE_QUIESCENT)
         flags |= DP_VS_SVC_F_EXPIRE_QUIESCENT;
 
-    conn = dp_vs_conn_new(mbuf, iph, &param, dest, flags);
+    conn = dp_vs_conn_new(nsid, mbuf, iph, &param, dest, flags);
     if (!conn)
         return NULL;
 

@@ -43,6 +43,7 @@
 #include <assert.h>
 #include <arpa/inet.h>
 #include <linux/rtnetlink.h>
+#include "conf/common.h"
 #include "list.h"
 #include "dpdk.h"
 #include "inet.h"
@@ -463,7 +464,7 @@ static inline int sa_pool_release(struct sa_entry_pool *pool,
  * dev is also a hint, the saddr(ifa) is the key.
  * af is needed when both saddr and daddr are NULL.
  */
-static int sa4_fetch(struct netif_port *dev,
+static int sa4_fetch(nsid_t nsid, struct netif_port *dev,
                      const struct sockaddr_in *daddr,
                      struct sockaddr_in *saddr)
 {
@@ -479,7 +480,7 @@ static int sa4_fetch(struct netif_port *dev,
     /* if source IP is assiged, we can find ifa->sa_pool
      * without @daddr and @dev. */
     if (saddr->sin_addr.s_addr) {
-        ifa = inet_addr_ifa_get(AF_INET, dev, (union inet_addr*)&saddr->sin_addr);
+        ifa = inet_addr_ifa_get(nsid, AF_INET, dev, (union inet_addr*)&saddr->sin_addr);
         if (!ifa)
             return EDPVS_NOTEXIST;
 
@@ -503,7 +504,7 @@ static int sa4_fetch(struct netif_port *dev,
     fl.fl4_oif = dev;
     fl.fl4_daddr.s_addr = daddr ? daddr->sin_addr.s_addr : htonl(INADDR_ANY);
     fl.fl4_saddr.s_addr = saddr ? saddr->sin_addr.s_addr : htonl(INADDR_ANY);
-    rt = route4_output(&fl);
+    rt = route4_output(dev->nsid, &fl);
     if (!rt)
         return EDPVS_NOROUTE;
 
@@ -512,7 +513,7 @@ static int sa4_fetch(struct netif_port *dev,
         inet_addr_select(AF_INET, rt->port, (union inet_addr *)&rt->dest,
                          RT_SCOPE_UNIVERSE, (union inet_addr *)&rt->src);
     }
-    ifa = inet_addr_ifa_get(AF_INET, rt->port, (union inet_addr *)&rt->src);
+    ifa = inet_addr_ifa_get(nsid, AF_INET, rt->port, (union inet_addr *)&rt->src);
     if (!ifa) {
         route4_put(rt);
         return EDPVS_NOTEXIST;
@@ -537,7 +538,7 @@ static int sa4_fetch(struct netif_port *dev,
     return err;
 }
 
-static int sa6_fetch(struct netif_port *dev,
+static int sa6_fetch(nsid_t nsid, struct netif_port *dev,
                      const struct sockaddr_in6 *daddr,
                      struct sockaddr_in6 *saddr)
 {
@@ -553,7 +554,7 @@ static int sa6_fetch(struct netif_port *dev,
     /* if source IP is assiged, we can find ifa->sa_pool
      * without @daddr and @dev. */
     if (!ipv6_addr_any(&saddr->sin6_addr)) {
-        ifa = inet_addr_ifa_get(AF_INET6, dev, (union inet_addr*)&saddr->sin6_addr);
+        ifa = inet_addr_ifa_get(nsid, AF_INET6, dev, (union inet_addr*)&saddr->sin6_addr);
         if (!ifa)
             return EDPVS_NOTEXIST;
 
@@ -579,7 +580,7 @@ static int sa6_fetch(struct netif_port *dev,
         fl6.fl6_daddr= daddr->sin6_addr;
     if (saddr)
         fl6.fl6_saddr= saddr->sin6_addr;
-    rt6 = route6_output(NULL, &fl6);
+    rt6 = route6_output(nsid, NULL, &fl6);
     if (!rt6)
         return EDPVS_NOROUTE;
 
@@ -590,7 +591,7 @@ static int sa6_fetch(struct netif_port *dev,
                          RT_SCOPE_UNIVERSE,
                          (union inet_addr *)&rt6->rt6_src.addr);
     }
-    ifa = inet_addr_ifa_get(AF_INET6, rt6->rt6_dev,
+    ifa = inet_addr_ifa_get(nsid, AF_INET6, rt6->rt6_dev,
                     (union inet_addr *)&rt6->rt6_src.addr);
     if (!ifa) {
         route6_put(rt6);
@@ -616,7 +617,7 @@ static int sa6_fetch(struct netif_port *dev,
     return err;
 }
 
-int sa_fetch(int af, struct netif_port *dev,
+int sa_fetch(nsid_t nsid, int af, struct netif_port *dev,
              const struct sockaddr_storage *daddr,
              struct sockaddr_storage *saddr)
 {
@@ -625,17 +626,17 @@ int sa_fetch(int af, struct netif_port *dev,
     if (unlikely(saddr && saddr->ss_family != af))
         return EDPVS_INVAL;
     if (AF_INET == af)
-        return sa4_fetch(dev, (const struct sockaddr_in *)daddr,
+        return sa4_fetch(nsid, dev, (const struct sockaddr_in *)daddr,
                 (struct sockaddr_in *)saddr);
     else if (AF_INET6 == af)
-        return sa6_fetch(dev, (const struct sockaddr_in6 *)daddr,
+        return sa6_fetch(nsid, dev, (const struct sockaddr_in6 *)daddr,
                 (struct sockaddr_in6 *)saddr);
     else
         return EDPVS_NOTSUPP;
 }
 
 /* call me with @saddr must not NULL */
-int sa_release(const struct netif_port *dev,
+int sa_release(nsid_t nsid, const struct netif_port *dev,
                const struct sockaddr_storage *daddr,
                const struct sockaddr_storage *saddr)
 {
@@ -650,17 +651,17 @@ int sa_release(const struct netif_port *dev,
 
     if (AF_INET == saddr->ss_family) {
         const struct sockaddr_in *saddr4 = (const struct sockaddr_in *)saddr;
-        ifa = inet_addr_ifa_get(AF_INET, dev,
+        ifa = inet_addr_ifa_get(nsid, AF_INET, dev,
                 (union inet_addr*)&saddr4->sin_addr);
         if (unlikely(!ifa))
-            ifa = inet_addr_ifa_get_expired(AF_INET, dev,
+            ifa = inet_addr_ifa_get_expired(nsid, AF_INET, dev,
                     (union inet_addr*)&saddr4->sin_addr);
     } else if (AF_INET6 == saddr->ss_family) {
         const struct sockaddr_in6 *saddr6 = (const struct sockaddr_in6 *)saddr;
-        ifa = inet_addr_ifa_get(AF_INET6, dev,
+        ifa = inet_addr_ifa_get(nsid, AF_INET6, dev,
                 (union inet_addr*)&saddr6->sin6_addr);
         if (unlikely(!ifa))
-            ifa = inet_addr_ifa_get_expired(AF_INET6, dev,
+            ifa = inet_addr_ifa_get_expired(nsid, AF_INET6, dev,
                     (union inet_addr*)&saddr6->sin6_addr);
     } else {
         return EDPVS_NOTSUPP;

@@ -21,6 +21,7 @@
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "route6.h"
 #include "neigh.h"
 #include "ipvs/ipvs.h"
@@ -739,7 +740,7 @@ static void tcp_out_init_seq(struct dp_vs_conn *conn, struct tcphdr *th)
 }
 
 /* set @verdict if failed to schedule */
-static int tcp_conn_sched(struct dp_vs_proto *proto,
+static int tcp_conn_sched(nsid_t nsid, struct dp_vs_proto *proto,
                           const struct dp_vs_iphdr *iph,
                           struct rte_mbuf *mbuf,
                           struct dp_vs_conn **conn,
@@ -760,7 +761,7 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
     /* When synproxy disabled, only SYN packets can arrive here.
      * So don't judge SYNPROXY flag here! If SYNPROXY flag judged, and syn_proxy
      * got disbled and keepalived reloaded, SYN packets for RS may never be sent. */
-    if (dp_vs_synproxy_ack_rcv(iph->af, mbuf, th, proto, conn, iph, verdict) == 0) {
+    if (dp_vs_synproxy_ack_rcv(nsid, iph->af, mbuf, th, proto, conn, iph, verdict) == 0) {
         /* Attention: First ACK packet is also stored in conn->ack_mbuf */
         return EDPVS_PKTSTOLEN;
     }
@@ -784,8 +785,8 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         /* Drop tcp packet which is send to vip and !vport */
         if (g_defence_tcp_drop &&
                 (svc = dp_vs_vip_lookup(iph->af, iph->proto,
-                                    &iph->daddr, rte_lcore_id()))) {
-            dp_vs_estats_inc(DEFENCE_TCP_DROP);
+                                    &iph->daddr, rte_lcore_id(), nsid))) {
+            dp_vs_estats_inc(nsid, DEFENCE_TCP_DROP);
             *verdict = INET_DROP;
             return EDPVS_INVPKT;
         }
@@ -794,14 +795,14 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVAL;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, th->dest,
+    svc = dp_vs_service_lookup(nsid, iph->af, iph->proto, &iph->daddr, th->dest,
                                0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         /* Drop tcp packet which is send to vip and !vport */
         if (g_defence_tcp_drop &&
                 (svc = dp_vs_vip_lookup(iph->af, iph->proto,
-                                   &iph->daddr, rte_lcore_id()))) {
-            dp_vs_estats_inc(DEFENCE_TCP_DROP);
+                                   &iph->daddr, rte_lcore_id(), nsid))) {
+            dp_vs_estats_inc(nsid, DEFENCE_TCP_DROP);
             *verdict = INET_DROP;
             return EDPVS_INVPKT;
         }
@@ -809,7 +810,7 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_NOSERV;
     }
 
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(nsid, svc, iph, mbuf, false);
     if (!*conn) {
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
@@ -819,7 +820,7 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
 }
 
 static struct dp_vs_conn *
-tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
+tcp_conn_lookup(nsid_t nsid, struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
                 struct rte_mbuf *mbuf, int *direct, bool reverse, bool *drop,
                 lcoreid_t *peer_cid)
 {
@@ -843,7 +844,7 @@ tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
         return NULL;
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto,
             &iph->saddr, &iph->daddr, th->source, th->dest, direct, reverse);
 
     /*
@@ -866,7 +867,7 @@ tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto,
                                &iph->saddr, &iph->daddr,
                                th->source, th->dest);
         if (r) {
@@ -1158,6 +1159,8 @@ struct rte_mempool *get_mbuf_pool(const struct dp_vs_conn *conn, int dir)
 {
     struct netif_port *dev;
     int af;
+    nsid_t nsid = conn->nsid;
+    assert(nsid != 0);
 
     /* we need oif for correct rte_mempoll,
      * most likely oif is conn->in/out_dev (fast-xmit),
@@ -1185,7 +1188,7 @@ struct rte_mempool *get_mbuf_pool(const struct dp_vs_conn *conn, int dir)
                 fl4.fl4_dport = conn->cport;
             }
             fl4.fl4_proto = IPPROTO_TCP;
-            if ((rt = route4_output(&fl4)) == NULL)
+            if ((rt = route4_output(nsid, &fl4)) == NULL)
                 return NULL;
             dev = rt->port;
             route4_put(rt);
@@ -1205,7 +1208,7 @@ struct rte_mempool *get_mbuf_pool(const struct dp_vs_conn *conn, int dir)
                 fl6.fl6_dport = conn->cport;
             }
             fl6.fl6_proto = IPPROTO_TCP;
-            if ((rt6 = route6_output(NULL, &fl6)) == NULL)
+            if ((rt6 = route6_output(nsid, NULL, &fl6)) == NULL)
                 return NULL;
             dev = rt6->rt6_dev;
             route6_put(rt6);

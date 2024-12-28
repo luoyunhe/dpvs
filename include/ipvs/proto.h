@@ -36,7 +36,7 @@ struct dp_vs_proto {
     int (*exit)(struct dp_vs_proto *proto);
 
     /* schedule RS and create new conn */
-    int (*conn_sched)(struct dp_vs_proto *proto,
+    int (*conn_sched)(nsid_t nsid, struct dp_vs_proto *proto,
                       const struct dp_vs_iphdr *iph,
                       struct rte_mbuf *mbuf,
                       struct dp_vs_conn **conn,
@@ -45,7 +45,7 @@ struct dp_vs_proto {
     /* lookup conn by <proto, saddr, sport, daddr, dport>
      * return conn and direction or NULL if miss */
     struct dp_vs_conn *
-        (*conn_lookup)(struct dp_vs_proto *proto,
+        (*conn_lookup)(nsid_t nsid, struct dp_vs_proto *proto,
                        const struct dp_vs_iphdr *iph,
                        struct rte_mbuf *mbuf, int *direct,
                        bool reverse, bool *drop, lcoreid_t *peer_cid);

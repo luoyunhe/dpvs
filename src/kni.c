@@ -34,6 +34,7 @@
 #include <linux/rtnetlink.h>
 #include "conf/common.h"
 #include "dpdk.h"
+#include "namespace.h"
 #include "netif.h"
 #include "conf/netif_addr.h"
 #include "ctrl.h"
@@ -109,6 +110,7 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
         ret = EDPVS_DPDKAPIFAIL;
         goto clean;
     }
+    nsid_set(port_id, dev->nsid);
     memset(&port_conf, 0, sizeof(struct rte_eth_conf));
     ret = rte_eth_dev_info_get(port_id, &dev_info);
     if (ret != 0)

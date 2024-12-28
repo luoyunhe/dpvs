@@ -18,6 +18,7 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/icmp6.h>
 #include <assert.h>
+#include "conf/common.h"
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -397,6 +398,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_xmit_info(mbuf, proto, conn);
@@ -419,7 +421,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->laddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -436,7 +438,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -446,7 +448,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(iph->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -486,7 +488,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
         ip4_send_csum(iph);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -504,6 +506,7 @@ static int __dp_vs_xmit_fnat6(struct dp_vs_proto *proto,
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_xmit_info(mbuf, proto, conn);
@@ -525,7 +528,7 @@ static int __dp_vs_xmit_fnat6(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->daddr.in6;
     fl6.fl6_saddr = conn->laddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -542,7 +545,7 @@ static int __dp_vs_xmit_fnat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
 
         err = EDPVS_FRAG;
         goto errout;
@@ -553,7 +556,7 @@ static int __dp_vs_xmit_fnat6(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -585,7 +588,7 @@ static int __dp_vs_xmit_fnat6(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -605,6 +608,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
     uint32_t pkt_len;
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -619,7 +623,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
     memset(&fl4, 0, sizeof(struct flow4));
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->laddr.in;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -640,7 +644,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
     pkt_len = mbuf_nat6to4_len(mbuf);
     if (pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
 
         err = EDPVS_FRAG;
         goto errout;
@@ -650,7 +654,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -685,7 +689,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
         ip4_send_csum(ip4h);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -724,6 +728,7 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_outxmit_info(mbuf, proto, conn);
@@ -743,7 +748,7 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->caddr.in;
     fl4.fl4_saddr = conn->vaddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -760,7 +765,7 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -770,7 +775,7 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(iph->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -809,7 +814,7 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
         ip4_send_csum(iph);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -827,6 +832,7 @@ static int __dp_vs_out_xmit_fnat6(struct dp_vs_proto *proto,
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_outxmit_info(mbuf, proto, conn);
@@ -845,7 +851,7 @@ static int __dp_vs_out_xmit_fnat6(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->caddr.in6;
     fl6.fl6_saddr = conn->vaddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -861,7 +867,7 @@ static int __dp_vs_out_xmit_fnat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -871,7 +877,7 @@ static int __dp_vs_out_xmit_fnat6(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -903,7 +909,7 @@ static int __dp_vs_out_xmit_fnat6(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -922,6 +928,7 @@ static int __dp_vs_out_xmit_fnat46(struct dp_vs_proto *proto,
     uint32_t pkt_len;
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -936,7 +943,7 @@ static int __dp_vs_out_xmit_fnat46(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->caddr.in6;
     fl6.fl6_saddr = conn->vaddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -958,7 +965,7 @@ static int __dp_vs_out_xmit_fnat46(struct dp_vs_proto *proto,
     if (pkt_len > mtu
            && (ip4h->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -967,7 +974,7 @@ static int __dp_vs_out_xmit_fnat46(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip4h->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -993,7 +1000,7 @@ static int __dp_vs_out_xmit_fnat46(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -1236,6 +1243,7 @@ static int __dp_vs_xmit_dr4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (unlikely(MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) != NULL)) {
         RTE_LOG(WARNING, IPVS, "%s: Already have route %p ?\n", __func__,
@@ -1247,7 +1255,7 @@ static int __dp_vs_xmit_dr4(struct dp_vs_proto *proto,
     fl4.fl4_daddr.s_addr = conn->daddr.in.s_addr;
     fl4.fl4_saddr.s_addr = iph->src_addr;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1260,7 +1268,7 @@ static int __dp_vs_xmit_dr4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1285,6 +1293,7 @@ static int __dp_vs_xmit_dr6(struct dp_vs_proto *proto,
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (unlikely(MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE) != NULL)) {
         RTE_LOG(WARNING, IPVS, "%s: Already have route %p ?\n", __func__,
@@ -1295,7 +1304,7 @@ static int __dp_vs_xmit_dr6(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->daddr.in6;
     fl6.fl6_saddr = ip6h->ip6_src;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1307,7 +1316,7 @@ static int __dp_vs_xmit_dr6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1344,6 +1353,7 @@ static int __dp_vs_xmit_snat4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -1364,7 +1374,7 @@ static int __dp_vs_xmit_snat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->caddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1376,7 +1386,7 @@ static int __dp_vs_xmit_snat4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1386,7 +1396,7 @@ static int __dp_vs_xmit_snat4(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(iph->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1411,7 +1421,7 @@ static int __dp_vs_xmit_snat4(struct dp_vs_proto *proto,
     else
         ip4_send_csum(iph);
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -1429,6 +1439,7 @@ static int __dp_vs_xmit_snat6(struct dp_vs_proto *proto,
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -1448,7 +1459,7 @@ static int __dp_vs_xmit_snat6(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->daddr.in6;
     fl6.fl6_saddr = conn->caddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1459,7 +1470,7 @@ static int __dp_vs_xmit_snat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1469,7 +1480,7 @@ static int __dp_vs_xmit_snat6(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1487,7 +1498,7 @@ static int __dp_vs_xmit_snat6(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -1517,6 +1528,7 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
     struct flow4 fl4;
     struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
+    nsid_t nsid = conn->nsid;
 
     if (!rt) {
         memset(&fl4, 0, sizeof(struct flow4));
@@ -1524,7 +1536,7 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
         fl4.fl4_saddr = conn->vaddr.in;
         fl4.fl4_tos = iph->type_of_service;
 
-        rt = route4_output(&fl4);
+        rt = route4_output(nsid, &fl4);
         if (!rt) {
             err = EDPVS_NOROUTE;
             goto errout;
@@ -1537,7 +1549,7 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > rt->mtu &&
             (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
                   htonl(rt->mtu));
         err = EDPVS_FRAG;
         goto errout;
@@ -1546,7 +1558,7 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(iph->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1571,7 +1583,7 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
     else
         ip4_send_csum(iph);
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -1679,12 +1691,13 @@ static int __dp_vs_out_xmit_snat6(struct dp_vs_proto *proto,
     struct flow6 fl6;
     struct route6 *rt6 = MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE);
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
+    nsid_t nsid = conn->nsid;
 
     if (!rt6) {
         memset(&fl6, 0, sizeof(struct flow6));
         fl6.fl6_daddr = conn->caddr.in6;
         fl6.fl6_saddr = conn->vaddr.in6;
-        rt6 = route6_output(mbuf, &fl6);
+        rt6 = route6_output(nsid, mbuf, &fl6);
         if (!rt6) {
             err = EDPVS_NOROUTE;
             goto errout;
@@ -1697,7 +1710,7 @@ static int __dp_vs_out_xmit_snat6(struct dp_vs_proto *proto,
 
     if (mbuf->pkt_len > rt6->rt6_mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, rt6->rt6_mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, rt6->rt6_mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1705,7 +1718,7 @@ static int __dp_vs_out_xmit_snat6(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1723,7 +1736,7 @@ static int __dp_vs_out_xmit_snat6(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -1753,6 +1766,7 @@ static int __dp_vs_xmit_nat4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_xmit_info(mbuf, proto, conn);
@@ -1775,7 +1789,7 @@ static int __dp_vs_xmit_nat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->caddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1787,7 +1801,7 @@ static int __dp_vs_xmit_nat4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
                   htonl(rt->mtu));
         err = EDPVS_FRAG;
         goto errout;
@@ -1798,7 +1812,7 @@ static int __dp_vs_xmit_nat4(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(iph->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1823,7 +1837,7 @@ static int __dp_vs_xmit_nat4(struct dp_vs_proto *proto,
         ip4_send_csum(iph);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -1841,6 +1855,7 @@ static int __dp_vs_xmit_nat6(struct dp_vs_proto *proto,
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -1855,7 +1870,7 @@ static int __dp_vs_xmit_nat6(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->daddr.in6;
     fl6.fl6_saddr = conn->caddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1866,7 +1881,7 @@ static int __dp_vs_xmit_nat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1876,7 +1891,7 @@ static int __dp_vs_xmit_nat6(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1894,7 +1909,7 @@ static int __dp_vs_xmit_nat6(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -1924,6 +1939,7 @@ static int __dp_vs_out_xmit_nat4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_outxmit_info(mbuf, proto, conn);
@@ -1946,7 +1962,7 @@ static int __dp_vs_out_xmit_nat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->caddr.in;
     fl4.fl4_saddr = conn->vaddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1958,7 +1974,7 @@ static int __dp_vs_out_xmit_nat4(struct dp_vs_proto *proto,
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
                   htonl(rt->mtu));
 
         err = EDPVS_FRAG;
@@ -1970,7 +1986,7 @@ static int __dp_vs_out_xmit_nat4(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(iph->time_to_live <= 1)) {
-            icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+            icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -1995,7 +2011,7 @@ static int __dp_vs_out_xmit_nat4(struct dp_vs_proto *proto,
         ip4_send_csum(iph);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -2013,6 +2029,7 @@ static int __dp_vs_out_xmit_nat6(struct dp_vs_proto *proto,
     struct ip6_hdr *ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -2027,7 +2044,7 @@ static int __dp_vs_out_xmit_nat6(struct dp_vs_proto *proto,
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->caddr.in6;
     fl6.fl6_saddr = conn->vaddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -2038,7 +2055,7 @@ static int __dp_vs_out_xmit_nat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -2048,7 +2065,7 @@ static int __dp_vs_out_xmit_nat6(struct dp_vs_proto *proto,
     /* after route lookup and before translation */
     if (xmit_ttl) {
         if (unlikely(ip6h->ip6_hops <= 1)) {
-            icmp6_send(mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
+            icmp6_send(nsid, mbuf, ICMP6_TIME_EXCEEDED, ICMP6_TIME_EXCEED_TRANSIT, 0);
             err = EDPVS_DROP;
             goto errout;
         }
@@ -2066,7 +2083,7 @@ static int __dp_vs_out_xmit_nat6(struct dp_vs_proto *proto,
             goto errout;
     }
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -2103,6 +2120,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
     uint16_t df = old_iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG);
     int err, mtu;
     uint32_t ip4h_len = sizeof(struct rte_ipv4_hdr);
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -2117,7 +2135,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
     memset(&fl4, 0, sizeof(struct flow4));
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_tos = tos;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -2130,7 +2148,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
 
     if (mbuf->pkt_len + ip4h_len > mtu && df) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
                   htonl(mtu - ip4h_len));
         err = EDPVS_FRAG;
         goto errout;
@@ -2162,7 +2180,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
         ip4_send_csum(new_iph);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:
@@ -2185,6 +2203,7 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
     struct route6 *rt6;
     int err, mtu;
     uint32_t ip6h_len = sizeof(struct ip6_hdr);
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -2198,7 +2217,7 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
 
     memset(&fl6, 0, sizeof(struct flow6));
     fl6.fl6_daddr = conn->daddr.in6;
-    rt6 = route6_output(mbuf, &fl6);
+    rt6 = route6_output(nsid, mbuf, &fl6);
     if (!rt6) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -2211,7 +2230,7 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
 
     if (mbuf->pkt_len + ip6h_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu - ip6h_len);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu - ip6h_len);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -2241,7 +2260,7 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
 
     new_ip6h->ip6_dst = conn->daddr.in6;
 
-    return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
 
 errout:
@@ -2261,6 +2280,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
     struct rte_ipv4_hdr *new_iph;
     struct ip6_hdr *old_ip6h = ip6_hdr(mbuf);
     uint32_t ip4h_len = sizeof(struct rte_ipv4_hdr);
+    nsid_t nsid = conn->nsid;
 
     /*
      * drop old route. just for safe, because
@@ -2275,7 +2295,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
     memset(&fl4, 0, sizeof(struct flow4));
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_tos = 0;
-    rt = route4_output(&fl4);
+    rt = route4_output(nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -2288,7 +2308,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
 
     if (mbuf->pkt_len + ip4h_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu - ip4h_len);
+        icmp6_send(nsid, mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu - ip4h_len);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -2319,7 +2339,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
         ip4_send_csum(new_iph);
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 
 errout:

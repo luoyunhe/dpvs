@@ -18,6 +18,7 @@
 #ifndef __DPVS_DEST_CONF_H__
 #define __DPVS_DEST_CONF_H__
 
+#include "conf/common.h"
 #include "conf/match.h"
 #include "conf/conn.h"
 
@@ -68,6 +69,7 @@ typedef struct dp_vs_dest_compat {
 } dpvs_dest_compat_t;
 
 typedef struct dp_vs_dest_table {
+    nsid_t          nsid;
     int             af;
     uint16_t        proto;
     uint16_t        port;
@@ -90,6 +92,9 @@ typedef struct dp_vs_dest_table {
 
 #ifdef CONFIG_DPVS_AGENT
 typedef struct dp_vs_dest_front {
+    nsid_t             nsid;
+    // 32bit align
+    uint8_t            nop[3];
     uint32_t           af;
     uint16_t           proto;
     uint16_t           port;

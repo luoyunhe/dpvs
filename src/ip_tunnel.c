@@ -126,7 +126,7 @@ static int tunnel_bind_dev(struct netif_port *dev)
             .fl4_oif            = tnl->link,
         };
 
-        rt = route4_output(&fl4);
+        rt = route4_output(dev->nsid, &fl4);
         if (rt) {
             linkdev = rt->port;
             route4_put(rt);
@@ -190,6 +190,8 @@ static struct netif_port *tunnel_create(struct ip_tunnel_tab *tab,
         if (!tnl->link) {
             RTE_LOG(WARNING, TUNNEL, "%s: invalid link device\n", __func__);
             tnl->params.link[0] = '\0';
+        } else {
+            dev->nsid = tnl->link->nsid;
         }
     }
 
@@ -331,6 +333,7 @@ static int tunnel_update_pmtu(struct netif_port *dev, struct rte_mbuf *mbuf,
     struct ip_tunnel *tnl = netif_priv(dev);
     int pkt_size = mbuf->pkt_len - tnl->hlen - dev->hw_header_len;
     int mtu;
+    nsid_t nsid = dev->nsid;
 
     if (df)
         mtu = rt->mtu - dev->hw_header_len - sizeof(struct iphdr) - tnl->hlen;
@@ -339,7 +342,7 @@ static int tunnel_update_pmtu(struct netif_port *dev, struct rte_mbuf *mbuf,
 
     if (mbuf->packet_type == RTE_ETHER_TYPE_IPV4) {
         if ((iiph->frag_off & htons(IP_DF)) && mtu < pkt_size) {
-            icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(mtu));
+            icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(mtu));
             return EDPVS_FRAG;
         }
     }
@@ -347,7 +350,7 @@ static int tunnel_update_pmtu(struct netif_port *dev, struct rte_mbuf *mbuf,
     return EDPVS_OK;
 }
 
-static int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
+static int tunnel_xmit(nsid_t nsid, struct rte_mbuf *mbuf, __be32 src, __be32 dst,
                        uint8_t proto, uint8_t tos, uint8_t ttl, __be16 df)
 {
     struct iphdr *oiph; /* outter IP header */
@@ -368,7 +371,7 @@ static int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
     oiph->ttl       = ttl;
     oiph->id        = ip4_select_id((struct rte_ipv4_hdr *)oiph);
 
-    return ipv4_local_out(mbuf);
+    return ipv4_local_out(nsid, mbuf);
 }
 
 static int tunnel_so_set(sockoptid_t opt, const void *arg, size_t inlen)
@@ -806,6 +809,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
     bool                connected;
     __be16              df;
     __be32              dip;
+    nsid_t nsid = dev->nsid;
 
     assert(mbuf && dev && tiph);
 
@@ -840,7 +844,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
         fl4.fl4_tos             = tos;
         fl4.fl4_oif             = tnl->link;
 
-        rt = route4_output(&fl4);
+        rt = route4_output(nsid, &fl4);
         if (!rt) {
             err = EDPVS_NOROUTE;
             goto errout;
@@ -877,7 +881,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
     if (!rt->src.s_addr)
         RTE_LOG(WARNING, TUNNEL, "%s: xmit with no source IP\n", __func__);
 
-    return tunnel_xmit(mbuf, rt->src.s_addr, dip, proto, tos, ttl, df);
+    return tunnel_xmit(nsid, mbuf, rt->src.s_addr, dip, proto, tos, ttl, df);
 
 errout:
     rte_pktmbuf_free(mbuf);

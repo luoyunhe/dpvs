@@ -35,6 +35,7 @@
 #include "ipvs/conn.h"
 #include "ipvs/service.h"
 #include "ipvs/redirect.h"
+#include "namespace.h"
 
 /*
  * o ICMP tuple
@@ -72,7 +73,7 @@ static int icmp_timeouts[DPVS_ICMP_S_LAST + 1] = {
     [DPVS_ICMP_S_LAST]      = 2,
 };
 
-static int icmp_conn_sched(struct dp_vs_proto *proto,
+static int icmp_conn_sched(nsid_t nsid, struct dp_vs_proto *proto,
                            const struct dp_vs_iphdr *iph,
                            struct rte_mbuf *mbuf,
                            struct dp_vs_conn **conn,
@@ -98,7 +99,7 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVPKT;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 0, 0,
+    svc = dp_vs_service_lookup(nsid, iph->af, iph->proto, &iph->daddr, 0, 0,
                                mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
@@ -106,7 +107,7 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
     }
 
     /* schedule RS and create new connection */
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(nsid, svc, iph, mbuf, false);
     if (!*conn) {
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
@@ -178,7 +179,7 @@ static bool is_icmp6_reply(uint8_t type) {
     return false;
 }
 
-static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
+static struct dp_vs_conn *icmp_conn_lookup(nsid_t nsid, struct dp_vs_proto *proto,
                                            const struct dp_vs_iphdr *iph,
                                            struct rte_mbuf *mbuf, int *direct,
                                            bool reverse, bool *drop,
@@ -233,14 +234,14 @@ static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
         }
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto, &iph->saddr, &iph->daddr,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto, &iph->saddr, &iph->daddr,
                           sport, dport, direct, reverse);
     if (conn) {
         return conn;
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto,
                                &iph->saddr, &iph->daddr,
                                sport, dport);
         if (r) {

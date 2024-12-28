@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <net/if.h>
+#include "conf/common.h"
 #include "inet.h"
 #include "conf/match.h"
 #include "conf/stats.h"
@@ -97,6 +98,9 @@ struct dest_check_configs {
 
 typedef struct dp_vs_service_compat {
     /*base*/
+    nsid_t              nsid;
+    // 对齐到64bit
+    uint8_t             nop[8-sizeof(nsid_t)];
     int                 af;
     uint8_t             proto;
     uint8_t             proxy_protocol; /* proxy protocol version: DISABLE | V1 | V2 */
@@ -128,6 +132,7 @@ typedef struct dp_vs_service_compat {
 #define dp_vs_service_user  dp_vs_service_compat
 
 typedef struct dp_vs_services_front {
+    nsid_t nsid;
     lcoreid_t cid;
     lcoreid_t index;
     uint16_t count;
@@ -135,10 +140,16 @@ typedef struct dp_vs_services_front {
 } dpvs_services_front_t;
 
 struct dp_vs_getinfo {
+    nsid_t nsid; 
     unsigned int version;
     unsigned int size;
     unsigned int num_services;
     unsigned int num_lcores;
+};
+
+struct dpvs_grat_arp {
+    nsid_t nsid;
+    struct in_addr addr;
 };
 
 static inline bool

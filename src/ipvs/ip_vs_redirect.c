@@ -15,6 +15,7 @@
  * GNU General Public License for more details.
  *
  */
+#include "conf/common.h"
 #include "ipvs/redirect.h"
 
 #define DPVS_REDIRECT_RING_SIZE  2048
@@ -23,8 +24,8 @@
 #define DPVS_CR_TBL_SIZE   (1 << DPVS_CR_TBL_BITS)
 #define DPVS_CR_TBL_MASK   (DPVS_CR_TBL_SIZE - 1)
 
-static struct list_head   *dp_vs_cr_tbl;
-static rte_spinlock_t      dp_vs_cr_lock[DPVS_CR_TBL_SIZE];
+static struct list_head   *dp_vs_cr_tbl[DPVS_MAX_NETNS];
+static rte_spinlock_t      dp_vs_cr_lock[DPVS_MAX_NETNS][DPVS_CR_TBL_SIZE];
 static struct rte_mempool *dp_vs_cr_cache[DPVS_MAX_SOCKET];
 #define this_cr_cache      (dp_vs_cr_cache[rte_socket_id()])
 
@@ -100,6 +101,7 @@ void dp_vs_redirect_hash(struct dp_vs_conn *conn)
 {
     uint32_t hash;
     struct dp_vs_redirect *r = conn->redirect;
+    nsid_t nsid = conn->nsid;
 
     if (!r || unlikely(dp_vs_conn_is_redirect_hashed(conn))) {
         return;
@@ -108,9 +110,9 @@ void dp_vs_redirect_hash(struct dp_vs_conn *conn)
     hash = dp_vs_conn_hashkey(r->af, &r->saddr, r->sport,
             &r->daddr, r->dport, DPVS_CR_TBL_MASK);
 
-    rte_spinlock_lock(&dp_vs_cr_lock[hash]);
-    list_add(&r->list, &dp_vs_cr_tbl[hash]);
-    rte_spinlock_unlock(&dp_vs_cr_lock[hash]);
+    rte_spinlock_lock(&dp_vs_cr_lock[nsid][hash]);
+    list_add(&r->list, &dp_vs_cr_tbl[nsid][hash]);
+    rte_spinlock_unlock(&dp_vs_cr_lock[nsid][hash]);
 
     dp_vs_conn_set_redirect_hashed(conn);
 }
@@ -119,14 +121,15 @@ void dp_vs_redirect_unhash(struct dp_vs_conn *conn)
 {
     uint32_t hash;
     struct dp_vs_redirect *r = conn->redirect;
+    nsid_t nsid = conn->nsid;
 
     if (r && likely(dp_vs_conn_is_redirect_hashed(conn))) {
         hash = dp_vs_conn_hashkey(r->af, &r->saddr, r->sport,
                 &r->daddr, r->dport, DPVS_CR_TBL_MASK);
 
-        rte_spinlock_lock(&dp_vs_cr_lock[hash]);
+        rte_spinlock_lock(&dp_vs_cr_lock[nsid][hash]);
         list_del(&r->list);
-        rte_spinlock_unlock(&dp_vs_cr_lock[hash]);
+        rte_spinlock_unlock(&dp_vs_cr_lock[nsid][hash]);
 
         dp_vs_conn_clear_redirect_hashed(conn);
     }
@@ -180,7 +183,7 @@ void dp_vs_redirect_init(struct dp_vs_conn *conn)
  * return r if found or NULL if not exist.
  */
 struct dp_vs_redirect *
-dp_vs_redirect_get(int af, uint16_t proto,
+dp_vs_redirect_get(nsid_t nsid, int af, uint16_t proto,
     const union inet_addr *saddr, const union inet_addr *daddr,
     uint16_t sport, uint16_t dport)
 {
@@ -193,8 +196,8 @@ dp_vs_redirect_get(int af, uint16_t proto,
 
     hash = dp_vs_conn_hashkey(af, saddr, sport, daddr, dport, DPVS_CR_TBL_MASK);
 
-    rte_spinlock_lock(&dp_vs_cr_lock[hash]);
-    list_for_each_entry(r, &dp_vs_cr_tbl[hash], list) {
+    rte_spinlock_lock(&dp_vs_cr_lock[nsid][hash]);
+    list_for_each_entry(r, &dp_vs_cr_tbl[nsid][hash], list) {
         if (r->af == af
             && r->proto == proto
             && r->sport == sport
@@ -204,12 +207,12 @@ dp_vs_redirect_get(int af, uint16_t proto,
             goto found;
         }
     }
-    rte_spinlock_unlock(&dp_vs_cr_lock[hash]);
+    rte_spinlock_unlock(&dp_vs_cr_lock[nsid][hash]);
 
     return NULL;
 
 found:
-    rte_spinlock_unlock(&dp_vs_cr_lock[hash]);
+    rte_spinlock_unlock(&dp_vs_cr_lock[nsid][hash]);
 
 #ifdef CONFIG_DPVS_IPVS_DEBUG
     dp_vs_redirect_show(r, "get");
@@ -281,7 +284,7 @@ static int dp_vs_redirect_cache_alloc(void)
 
         dp_vs_cr_cache[i] =
             rte_mempool_create(pool_name,
-                               dp_vs_conn_pool_size(),
+                               dp_vs_conn_pool_size() * DPVS_MAX_NETNS,
                                sizeof(struct dp_vs_redirect),
                                dp_vs_conn_pool_cache_size(),
                                0, NULL, NULL, NULL, NULL,
@@ -307,24 +310,29 @@ static void dp_vs_redirect_cache_free(void)
 static int dp_vs_redirect_table_create(void)
 {
     int i;
+    nsid_t nsid;
 
     if (dp_vs_redirect_cache_alloc() != EDPVS_OK) {
         goto cache_free;
     }
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        /* allocate the global redirect hash table, per socket? */
+        dp_vs_cr_tbl[nsid] =
+            rte_malloc(NULL, sizeof(struct list_head ) * DPVS_CR_TBL_SIZE,
+                            RTE_CACHE_LINE_SIZE);
+        if (!dp_vs_cr_tbl[nsid]) {
+            goto cache_free;
+        }
 
-    /* allocate the global redirect hash table, per socket? */
-    dp_vs_cr_tbl =
-        rte_malloc(NULL, sizeof(struct list_head ) * DPVS_CR_TBL_SIZE,
-                          RTE_CACHE_LINE_SIZE);
-    if (!dp_vs_cr_tbl) {
-        goto cache_free;
+        /* init the global redirect hash table */
+
+        for (i = 0; i < DPVS_CR_TBL_SIZE; i++) {
+            INIT_LIST_HEAD(&dp_vs_cr_tbl[nsid][i]);
+            rte_spinlock_init(&dp_vs_cr_lock[nsid][i]);
+        }
+
     }
 
-    /* init the global redirect hash table */
-    for (i = 0; i < DPVS_CR_TBL_SIZE; i++) {
-        INIT_LIST_HEAD(&dp_vs_cr_tbl[i]);
-        rte_spinlock_init(&dp_vs_cr_lock[i]);
-    }
 
     return EDPVS_OK;
 
@@ -335,12 +343,14 @@ cache_free:
 
 static void dp_vs_redirect_table_free(void)
 {
+    nsid_t nsid;
     dp_vs_redirect_cache_free();
-
-    /* release the global redirect hash table */
-    if (dp_vs_cr_tbl) {
-        rte_free(dp_vs_cr_tbl);
-    }
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        /* release the global redirect hash table */
+        if (dp_vs_cr_tbl[nsid]) {
+            rte_free(dp_vs_cr_tbl[nsid]);
+        }
+    } 
 }
 
 /*

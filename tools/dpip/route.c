@@ -15,6 +15,7 @@
  * GNU General Public License for more details.
  *
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -399,6 +400,7 @@ static int route4_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
 
     if (route4_parse_args(conf, &route) != 0)
         return EDPVS_INVAL;
+    route.nsid = g_nsid;
 
     switch (conf->cmd) {
     case DPIP_CMD_ADD:
@@ -447,7 +449,7 @@ static int route6_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
 
     if (route6_parse_args(conf, &rt6_cfg) != 0)
         return EDPVS_INVAL;
-
+    rt6_cfg.nsid = g_nsid;
     switch (conf->cmd) {
         case DPIP_CMD_ADD:
             rt6_cfg.ops = RT6_OPS_ADD;

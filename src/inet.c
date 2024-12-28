@@ -19,6 +19,7 @@
 #include <string.h>
 #include <assert.h>
 #include <netinet/in.h>
+#include "conf/common.h"
 #include "inet.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -227,9 +228,9 @@ static int __inet_register_hooks(struct list_head *head,
     return EDPVS_OK;
 }
 
-int INET_HOOK(int af, unsigned int hook, struct rte_mbuf *mbuf,
+int INET_HOOK(nsid_t nsid, int af, unsigned int hook, struct rte_mbuf *mbuf,
               struct netif_port *in, struct netif_port *out,
-              int (*okfn)(struct rte_mbuf *mbuf))
+              int (*okfn)(nsid_t nsid, struct rte_mbuf *mbuf))
 {
     struct list_head *hook_list;
     struct inet_hook_ops *ops;
@@ -245,7 +246,7 @@ int INET_HOOK(int af, unsigned int hook, struct rte_mbuf *mbuf,
         verdict = INET_ACCEPT;
         list_for_each_entry_continue(ops, hook_list, list) {
 repeat:
-            verdict = ops->hook(ops->priv, mbuf, &state);
+            verdict = ops->hook(nsid, ops->priv, mbuf, &state);
             if (verdict != INET_ACCEPT) {
                 if (verdict == INET_REPEAT)
                     goto repeat;
@@ -255,7 +256,7 @@ repeat:
     }
 
     if (verdict == INET_ACCEPT || verdict == INET_STOP) {
-        return okfn(mbuf);
+        return okfn(nsid, mbuf);
     } else if (verdict == INET_DROP) {
         rte_pktmbuf_free(mbuf);
         return EDPVS_DROP;

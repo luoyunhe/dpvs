@@ -21,6 +21,7 @@
 #include <arpa/inet.h>
 #include <rte_ether.h>
 #include <rte_arp.h>
+#include <string.h>
 
 #include "dpdk.h"
 #include "parser/parser.h"
@@ -42,7 +43,7 @@
 #define DPVS_NEIGH_TIMEOUT_MIN 1
 #define DPVS_NEIGH_TIMEOUT_MAX 3600
 
-static int neigh_nums[DPVS_MAX_LCORE] = { 0 };
+static int neigh_nums[DPVS_MAX_LCORE][DPVS_MAX_NETNS] = { 0 };
 static struct dpvs_mempool *neigh_mempool;
 
 struct neighbour_mbuf_entry {
@@ -58,6 +59,11 @@ struct raw_neigh {
     bool                    add;
     uint8_t                 flag;
 } __rte_cache_aligned;
+
+struct neigh_get {
+    nsid_t nsid;
+    char   ifname[IFNAMSIZ];
+};
 
 struct nud_state {
     int next_state[DPVS_NUD_S_MAX];
@@ -145,7 +151,7 @@ void install_neighbor_keywords(void)
 
 static lcoreid_t master_cid = 0;
 
-static struct list_head neigh_table[DPVS_MAX_LCORE][NEIGH_TAB_SIZE];
+static struct list_head neigh_table[DPVS_MAX_LCORE][DPVS_MAX_NETNS][NEIGH_TAB_SIZE];
 
 static struct raw_neigh *neigh_ring_clone_entry(const struct neighbour_entry *neighbour,
                                                 bool add);
@@ -224,7 +230,7 @@ static inline int neigh_hash(struct neighbour_entry *neighbour, unsigned int has
     lcoreid_t cid = rte_lcore_id();
 
     if (!(neighbour->flag & NEIGHBOUR_HASHED)) {
-        list_add(&neighbour->neigh_list, &neigh_table[cid][hashkey]);
+        list_add(&neighbour->neigh_list, &neigh_table[cid][neighbour->port->nsid][hashkey]);
         neighbour->flag |= NEIGHBOUR_HASHED;
         return EDPVS_OK;
     }
@@ -258,6 +264,7 @@ static int neigh_entry_expire(struct neighbour_entry *neighbour)
     struct neighbour_mbuf_entry *mbuf, *mbuf_next;
     lcoreid_t cid = rte_lcore_id();
     assert(cid != master_cid);
+    nsid_t nsid = neighbour->port->nsid;
 
     dpvs_timer_cancel_nolock(&neighbour->timer, false);
     neigh_unhash(neighbour);
@@ -279,7 +286,7 @@ static int neigh_entry_expire(struct neighbour_entry *neighbour)
     }
 
     dpvs_mempool_put(neigh_mempool, neighbour);
-    neigh_nums[cid]--;
+    neigh_nums[cid][nsid]--;
 
     return DTIMER_STOP;
 }
@@ -338,7 +345,7 @@ struct neighbour_entry *neigh_lookup_entry(int af, const union inet_addr *key,
 {
     struct neighbour_entry *neighbour;
     lcoreid_t cid = rte_lcore_id();
-    list_for_each_entry(neighbour, &neigh_table[cid][hashkey], neigh_list){
+    list_for_each_entry(neighbour, &neigh_table[cid][port->nsid][hashkey], neigh_list){
         if(neigh_key_cmp(af, neighbour, key, port)) {
             return neighbour;
         }
@@ -396,7 +403,7 @@ struct neighbour_entry *neigh_add_table(int af, const union inet_addr *ipaddr,
     }
 
     neigh_hash(new_neighbour, hashkey);
-    neigh_nums[cid]++;
+    neigh_nums[cid][port->nsid]++;
 
 #ifdef CONFIG_DPVS_NEIGH_DEBUG
     {
@@ -458,7 +465,7 @@ void neigh_confirm(int af, union inet_addr *nexthop, struct netif_port *port)
 
     /*find nexhop/neighbour to confirm, no matter whether it is the route in*/
     hashkey = neigh_hashkey(af, nexthop, port);
-    list_for_each_entry(neighbour, &neigh_table[cid][hashkey], neigh_list) {
+    list_for_each_entry(neighbour, &neigh_table[cid][port->nsid][hashkey], neigh_list) {
         if (neigh_key_cmp(af, neighbour, nexthop, port) &&
             !(neighbour->flag & NEIGHBOUR_STATIC)) {
             neigh_entry_state_trans(neighbour, 2);
@@ -500,8 +507,9 @@ int neigh_resolve_input(struct rte_mbuf *m, struct netif_port *port)
     struct neighbour_entry *neighbour = NULL;
     unsigned int hashkey;
     struct inet_ifaddr *ifa;
+    nsid_t nsid = port->nsid;
 
-    ifa = inet_addr_ifa_get(AF_INET, port, (union inet_addr *)&arp->arp_data.arp_tip);
+    ifa = inet_addr_ifa_get(nsid, AF_INET, port, (union inet_addr *)&arp->arp_data.arp_tip);
     if (!ifa)
         return EDPVS_KNICONTINUE;
     inet_addr_ifa_put(ifa);
@@ -858,7 +866,7 @@ static void neigh_process_ring(void *arg)
                        dpvs_mempool_put(neigh_mempool, mbuf);
                    }
                    dpvs_mempool_put(neigh_mempool, neigh);
-                   neigh_nums[cid]--;
+                   neigh_nums[cid][param->port->nsid]--;
                } else {
                    RTE_LOG(WARNING, NEIGHBOUR, "%s: not exist\n", __func__);
                }
@@ -885,7 +893,7 @@ static void neigh_fill_param(struct dp_vs_neigh_conf  *param,
     memcpy(&param->ifname, entry->port->name, IFNAMSIZ);
 }
 
-static void neigh_fill_array(struct netif_port *dev, lcoreid_t cid,
+static void neigh_fill_array(nsid_t nsid, struct netif_port *dev, lcoreid_t cid,
                              struct dp_vs_neigh_conf_array *array,
                              size_t neigh_nums)
 {
@@ -896,7 +904,7 @@ static void neigh_fill_array(struct netif_port *dev, lcoreid_t cid,
 
     if (dev) {
         for (hash = 0; hash < NEIGH_TAB_SIZE; hash++) {
-            list_for_each_entry(entry, &neigh_table[cid][hash], neigh_list) {
+            list_for_each_entry(entry, &neigh_table[cid][nsid][hash], neigh_list) {
                 if (dev == entry->port) {
                     if (off >= neigh_nums) {
                         RTE_LOG(WARNING, NEIGHBOUR, "%s: neigh num not match\n", __func__);
@@ -909,7 +917,7 @@ static void neigh_fill_array(struct netif_port *dev, lcoreid_t cid,
         }
     } else {
         for (hash = 0; hash < NEIGH_TAB_SIZE; hash++) {
-            list_for_each_entry(entry, &neigh_table[cid][hash], neigh_list) {
+            list_for_each_entry(entry, &neigh_table[cid][nsid][hash], neigh_list) {
                 if (off >= neigh_nums) {
                     RTE_LOG(WARNING, NEIGHBOUR, "%s: neigh num not match\n", __func__);
                     break;
@@ -927,18 +935,24 @@ static int get_neigh_uc_cb(struct dpvs_msg *msg)
     struct dp_vs_neigh_conf_array *array;
     int len;
     lcoreid_t cid = rte_lcore_id();
+    struct neigh_get* param;
 
-    if (msg->len)
-        dev = netif_port_get_by_name((char *)msg->data);
+    
+    if (msg->len){
+        param = (struct neigh_get *)msg->data;
+        if (param->ifname[0])
+            dev = netif_port_get_by_name(param->ifname);
+    } else
+        return EDPVS_INVAL;
 
     len = sizeof(struct dp_vs_neigh_conf_array) +
-          sizeof(struct dp_vs_neigh_conf) * neigh_nums[cid];
+          sizeof(struct dp_vs_neigh_conf) * neigh_nums[cid][param->nsid];
     array = msg_reply_alloc(len);
     if (unlikely(!array))
         return EDPVS_NOMEM;
     array->neigh_nums = 0;
 
-    neigh_fill_array(dev, cid, array, neigh_nums[cid]);
+    neigh_fill_array(param->nsid, dev, cid, array, neigh_nums[cid][param->nsid]);
     msg->reply.len = len;
     msg->reply.data = (void *)array;
 
@@ -955,23 +969,29 @@ static int neigh_sockopt_get(sockoptid_t opt, const void *conf,
     struct dpvs_msg *msg, *cur;
     struct dpvs_multicast_queue *reply = NULL;
     int neigh_nums_g = 0, err;
+    struct neigh_get get;
 
     if (conf && size >= sizeof(*cf))
         cf = conf;
     else
-        cf = NULL;
+        return EDPVS_INVAL;
+    get.nsid = cf->nsid;
 
     if (cf && strlen(cf->ifname)) {
         port = netif_port_get_by_name(cf->ifname);
         if (!port) {
             RTE_LOG(WARNING, NEIGHBOUR, "%s: no such device: %s\n",
                     __func__, cf->ifname);
-            return EDPVS_NOTEXIST;
         }
     }
+    if (port)
+        memcpy(get.ifname, port->name, sizeof(get.ifname));
+    else
+        memset(get.ifname, 0, sizeof(get.ifname));
+
 
     msg = msg_make(MSG_TYPE_NEIGH_GET, 0 , DPVS_MSG_MULTICAST, rte_lcore_id(),
-                   port ? sizeof(port->name) : 0, port ? (&port->name) : NULL);
+                   sizeof(get), &get);
     if (!msg)
         return EDPVS_NOMEM;
     err = multicast_msg_send(msg, 0, &reply);
@@ -1126,11 +1146,14 @@ static struct dpvs_lcore_job_array neigh_jobs[NEIGH_LCORE_JOB_MAX] = {
 static int arp_init(void)
 {
     int i, j;
+    nsid_t nsid;
     int err;
 
     for (i = 0; i < DPVS_MAX_LCORE; i++) {
-        for (j = 0; j < NEIGH_TAB_SIZE; j++) {
-            INIT_LIST_HEAD(&neigh_table[i][j]);
+        for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++){
+            for (j = 0; j < NEIGH_TAB_SIZE; j++) {
+                INIT_LIST_HEAD(&neigh_table[i][nsid][j]);
+            }
         }
     }
 

@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <net/if.h>
+#include "conf/common.h"
 #include "ipvs/stats.h"
 #include "ipvs/dest.h"
 #include "inet.h"
@@ -99,7 +100,7 @@ int dp_vs_service_init(void);
 int dp_vs_service_term(void);
 
 struct dp_vs_service *
-dp_vs_service_lookup(int af, uint16_t protocol,
+dp_vs_service_lookup(nsid_t nsid, int af, uint16_t protocol,
                      const union inet_addr *vaddr,
                      uint16_t vport, uint32_t fwmark,
                      const struct rte_mbuf *mbuf,
@@ -114,7 +115,7 @@ void dp_vs_service_put(struct dp_vs_service *svc);
 
 struct dp_vs_service *dp_vs_vip_lookup(int af, uint16_t protocol,
                                        const union inet_addr *vaddr,
-                                       lcoreid_t cid);
+                                       lcoreid_t cid, nsid_t nsid);
 void dp_vs_copy_udest_compat(struct dp_vs_dest_conf *udest, dpvs_dest_compat_t *udest_compat);
 
 #endif /* __DPVS_SVC_H__ */

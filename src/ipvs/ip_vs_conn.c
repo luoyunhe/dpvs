@@ -21,6 +21,7 @@
 #include "inet.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "sa_pool.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/conn.h"
@@ -69,16 +70,16 @@ bool dp_vs_redirect_disable = true;
 /*
  * per-lcore dp_vs_conn{} hash table.
  */
-static RTE_DEFINE_PER_LCORE(struct list_head *, dp_vs_conn_tbl);
+static RTE_DEFINE_PER_LCORE(struct list_head *[DPVS_MAX_NETNS], dp_vs_conn_tbl);
 #ifdef CONFIG_DPVS_IPVS_CONN_LOCK
 static RTE_DEFINE_PER_LCORE(rte_spinlock_t, dp_vs_conn_lock);
 #endif
 
 /* global connection template table */
-static struct list_head *dp_vs_ct_tbl;
-static rte_spinlock_t dp_vs_ct_lock;
+static struct list_head *dp_vs_ct_tbl[DPVS_MAX_NETNS];
+static rte_spinlock_t dp_vs_ct_lock[DPVS_MAX_NETNS];
 
-static RTE_DEFINE_PER_LCORE(uint32_t, dp_vs_conn_count);
+static RTE_DEFINE_PER_LCORE(uint32_t[DPVS_MAX_NETNS], dp_vs_conn_count);
 
 static uint32_t dp_vs_conn_rnd; /* hash random */
 
@@ -89,7 +90,7 @@ static struct rte_mempool *dp_vs_conn_cache[DPVS_MAX_SOCKET];
 
 static int dp_vs_conn_expire(void *priv);
 
-static struct dp_vs_conn *dp_vs_conn_alloc(enum dpvs_fwd_mode fwdmode,
+static struct dp_vs_conn *dp_vs_conn_alloc(nsid_t nsid, enum dpvs_fwd_mode fwdmode,
                                            uint32_t flags)
 {
     struct dp_vs_conn *conn;
@@ -102,7 +103,8 @@ static struct dp_vs_conn *dp_vs_conn_alloc(enum dpvs_fwd_mode fwdmode,
 
     memset(conn, 0, sizeof(struct dp_vs_conn));
     conn->connpool = this_conn_cache;
-    this_conn_count++;
+    conn->nsid = nsid;
+    this_conn_count[nsid]++;
 
     /* no need to create redirect for the global template connection */
     if (likely((flags & DPVS_CONN_F_TEMPLATE) == 0))
@@ -117,11 +119,11 @@ static void dp_vs_conn_free(struct dp_vs_conn *conn)
 {
     if (!conn)
         return;
-
+    nsid_t nsid = conn->nsid;
     dp_vs_redirect_free(conn);
 
     rte_mempool_put(conn->connpool, conn);
-    this_conn_count--;
+    this_conn_count[nsid]--;
 }
 
 static void dp_vs_conn_attach_timer(struct dp_vs_conn *conn, bool lock)
@@ -237,6 +239,8 @@ inline uint32_t dp_vs_conn_hashkey(int af,
 static inline int __dp_vs_conn_hash(struct dp_vs_conn *conn, uint32_t mask)
 {
     uint32_t ihash, ohash;
+    nsid_t nsid = conn->nsid;
+    assert(nsid >= 0);
 
     if (unlikely(conn->flags & DPVS_CONN_F_HASHED))
         return EDPVS_EXIST;
@@ -253,13 +257,13 @@ static inline int __dp_vs_conn_hash(struct dp_vs_conn *conn, uint32_t mask)
 
     if (dp_vs_conn_is_template(conn)) {
         /* lock is complusory for template */
-        rte_spinlock_lock(&dp_vs_ct_lock);
-        list_add(&tuplehash_in(conn).list, &dp_vs_ct_tbl[ihash]);
-        list_add(&tuplehash_out(conn).list, &dp_vs_ct_tbl[ohash]);
-        rte_spinlock_unlock(&dp_vs_ct_lock);
+        rte_spinlock_lock(&dp_vs_ct_lock[nsid]);
+        list_add(&tuplehash_in(conn).list, &dp_vs_ct_tbl[nsid][ihash]);
+        list_add(&tuplehash_out(conn).list, &dp_vs_ct_tbl[nsid][ohash]);
+        rte_spinlock_unlock(&dp_vs_ct_lock[nsid]);
     } else {
-        list_add(&tuplehash_in(conn).list, &this_conn_tbl[ihash]);
-        list_add(&tuplehash_out(conn).list, &this_conn_tbl[ohash]);
+        list_add(&tuplehash_in(conn).list, &this_conn_tbl[nsid][ihash]);
+        list_add(&tuplehash_out(conn).list, &this_conn_tbl[nsid][ohash]);
     }
 
     conn->flags |= DPVS_CONN_F_HASHED;
@@ -271,7 +275,6 @@ static inline int __dp_vs_conn_hash(struct dp_vs_conn *conn, uint32_t mask)
 static inline int dp_vs_conn_hash(struct dp_vs_conn *conn)
 {
     int err;
-
     if (conn->flags & DPVS_CONN_F_ONE_PACKET) {
         return EDPVS_OK;
     }
@@ -294,6 +297,7 @@ static inline int dp_vs_conn_hash(struct dp_vs_conn *conn)
 static inline int dp_vs_conn_unhash(struct dp_vs_conn *conn)
 {
     int err;
+    nsid_t nsid = conn->nsid;
 
 #ifdef CONFIG_DPVS_IPVS_CONN_LOCK
     rte_spinlock_lock(&this_conn_lock);
@@ -305,10 +309,10 @@ static inline int dp_vs_conn_unhash(struct dp_vs_conn *conn)
             dp_vs_redirect_unhash(conn);
 
             if (dp_vs_conn_is_template(conn)) {
-                rte_spinlock_lock(&dp_vs_ct_lock);
+                rte_spinlock_lock(&dp_vs_ct_lock[nsid]);
                 list_del(&tuplehash_in(conn).list);
                 list_del(&tuplehash_out(conn).list);
-                rte_spinlock_unlock(&dp_vs_ct_lock);
+                rte_spinlock_unlock(&dp_vs_ct_lock[nsid]);
             } else {
                 list_del(&tuplehash_in(conn).list);
                 list_del(&tuplehash_out(conn).list);
@@ -448,7 +452,7 @@ static inline void conn_tuplehash_dump(const char *msg,
             saddr, ntohs(t->sport), daddr, ntohs(t->dport));
 }
 
-static inline void conn_table_dump(void)
+static inline void conn_table_dump(nsid_t nsid)
 {
     int i;
     struct conn_tuple_hash *tuphash;
@@ -460,12 +464,12 @@ static inline void conn_table_dump(void)
 #endif
 
     for (i = 0; i < DPVS_CONN_TBL_SIZE; i++) {
-        if (list_empty(&this_conn_tbl[i]))
+        if (list_empty(&this_conn_tbl[nsid][i]))
             continue;
 
         RTE_LOG(DEBUG, IPVS, "    hash %d\n", i);
 
-        list_for_each_entry(tuphash, &this_conn_tbl[i], list) {
+        list_for_each_entry(tuphash, &this_conn_tbl[nsid][i], list) {
             conn_tuplehash_dump("        ", tuphash);
         }
     }
@@ -566,7 +570,7 @@ static int dp_vs_conn_resend_packets(struct dp_vs_conn *conn,
         }
 
         rte_atomic32_dec(&conn->syn_retry_max);
-        dp_vs_estats_inc(SYNPROXY_RS_ERROR);
+        dp_vs_estats_inc(conn->nsid, SYNPROXY_RS_ERROR);
 
         return EDPVS_OK;
     }
@@ -611,7 +615,7 @@ static void dp_vs_conn_sa_release(struct dp_vs_conn *conn)
         saddr6->sin6_port = conn->vport;
     }
 
-    sa_release(conn->out_dev, (struct sockaddr_storage *)&daddr,
+    sa_release(conn->nsid, conn->out_dev, (struct sockaddr_storage *)&daddr,
                (struct sockaddr_storage *)&saddr);
 }
 
@@ -726,7 +730,7 @@ void dp_vs_conn_expire_now(struct dp_vs_conn *conn)
     return;
 }
 
-static void conn_flush(void)
+static void conn_flush(nsid_t nsid)
 {
     struct conn_tuple_hash *tuphash, *next;
     struct dp_vs_conn *conn;
@@ -736,7 +740,7 @@ static void conn_flush(void)
     rte_spinlock_lock(&this_conn_lock);
 #endif
     for (i = 0; i < DPVS_CONN_TBL_SIZE; i++) {
-        list_for_each_entry_safe(tuphash, next, &this_conn_tbl[i], list) {
+        list_for_each_entry_safe(tuphash, next, &this_conn_tbl[nsid][i], list) {
             conn = tuplehash_to_conn(tuphash);
 
             dp_vs_conn_detach_timer(conn, true);
@@ -780,7 +784,7 @@ static void conn_flush(void)
                         RTE_LOG(WARNING, IPVS, "%s: conn address family %d "
                                 "not supported!\n", __func__, conn->af);
                     }
-                    sa_release(conn->out_dev, (struct sockaddr_storage *)&daddr,
+                    sa_release(nsid, conn->out_dev, (struct sockaddr_storage *)&daddr,
                               (struct sockaddr_storage *)&saddr);
                 }
 
@@ -801,7 +805,7 @@ static void conn_flush(void)
 #endif
 }
 
-struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
+struct dp_vs_conn *dp_vs_conn_new(nsid_t nsid, struct rte_mbuf *mbuf,
                                   const struct dp_vs_iphdr *iph,
                                   struct dp_vs_conn_param *param,
                                   struct dp_vs_dest *dest, uint32_t flags)
@@ -814,7 +818,7 @@ struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
 
     assert(mbuf && param && dest);
 
-    new = dp_vs_conn_alloc(dest->fwdmode, flags);
+    new = dp_vs_conn_alloc(nsid, dest->fwdmode, flags);
     if (unlikely(!new))
         return NULL;
 
@@ -1005,7 +1009,7 @@ errout:
  * dp_vs_conn_tab[] for current lcore will be looked up.
  * return conn found and direction as well or NULL if not exist.
  */
-struct dp_vs_conn *dp_vs_conn_get(int af, uint16_t proto,
+struct dp_vs_conn *dp_vs_conn_get(nsid_t nsid, int af, uint16_t proto,
             const union inet_addr *saddr, const union inet_addr *daddr,
             uint16_t sport, uint16_t dport, int *dir, bool reverse)
 {
@@ -1028,7 +1032,7 @@ struct dp_vs_conn *dp_vs_conn_get(int af, uint16_t proto,
     rte_spinlock_lock(&this_conn_lock);
 #endif
     if (unlikely(reverse)) { /* swap source/dest for lookup */
-        list_for_each_entry(tuphash, &this_conn_tbl[hash], list) {
+        list_for_each_entry(tuphash, &this_conn_tbl[nsid][hash], list) {
             if (tuphash->sport == dport
                     && tuphash->dport == sport
                     && inet_addr_equal(af, &tuphash->saddr, daddr)
@@ -1044,7 +1048,7 @@ struct dp_vs_conn *dp_vs_conn_get(int af, uint16_t proto,
             }
         }
     } else {
-        list_for_each_entry(tuphash, &this_conn_tbl[hash], list) {
+        list_for_each_entry(tuphash, &this_conn_tbl[nsid][hash], list) {
             if (tuphash->sport == sport
                     && tuphash->dport == dport
                     && inet_addr_equal(af, &tuphash->saddr, saddr)
@@ -1076,7 +1080,7 @@ struct dp_vs_conn *dp_vs_conn_get(int af, uint16_t proto,
 }
 
 /* get reference to connection template */
-struct dp_vs_conn *dp_vs_ct_in_get(int af, uint16_t proto,
+struct dp_vs_conn *dp_vs_ct_in_get(nsid_t nsid, int af, uint16_t proto,
         const union inet_addr *saddr, const union inet_addr *daddr,
         uint16_t sport, uint16_t dport)
 {
@@ -1091,8 +1095,8 @@ struct dp_vs_conn *dp_vs_ct_in_get(int af, uint16_t proto,
     hash = dp_vs_conn_hashkey(af, saddr, sport, daddr, dport,
                               DPVS_CONN_TBL_MASK);
 
-    rte_spinlock_lock(&dp_vs_ct_lock);
-    list_for_each_entry(tuphash, &dp_vs_ct_tbl[hash], list) {
+    rte_spinlock_lock(&dp_vs_ct_lock[nsid]);
+    list_for_each_entry(tuphash, &dp_vs_ct_tbl[nsid][hash], list) {
         conn = tuplehash_to_conn(tuphash);
         if (tuphash->sport == sport && tuphash->dport == dport
                 && inet_addr_equal(af, &tuphash->saddr, saddr)
@@ -1106,7 +1110,7 @@ struct dp_vs_conn *dp_vs_ct_in_get(int af, uint16_t proto,
             break;
         }
     }
-    rte_spinlock_unlock(&dp_vs_ct_lock);
+    rte_spinlock_unlock(&dp_vs_ct_lock[nsid]);
 
 #ifdef CONFIG_DPVS_IPVS_DEBUG
     RTE_LOG(DEBUG, IPVS, "conn-template lookup: [%d] %s %s/%d -> %s/%d %s\n",
@@ -1192,6 +1196,7 @@ static void dp_vs_conn_put_nolock(struct dp_vs_conn *conn)
 static int conn_init_lcore(void *arg)
 {
     int i;
+    nsid_t nsid;
     lcoreid_t cid = rte_lcore_id();
 
     if (cid >= DPVS_MAX_LCORE)
@@ -1202,20 +1207,22 @@ static int conn_init_lcore(void *arg)
 
     if (!netif_lcore_is_fwd_worker(cid))
         return EDPVS_IDLE;
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        this_conn_tbl[nsid] = rte_malloc(NULL,
+                            sizeof(struct list_head) * DPVS_CONN_TBL_SIZE,
+                            RTE_CACHE_LINE_SIZE);
+        if (!this_conn_tbl[nsid])
+            return EDPVS_NOMEM;
 
-    this_conn_tbl = rte_malloc(NULL,
-                        sizeof(struct list_head) * DPVS_CONN_TBL_SIZE,
-                        RTE_CACHE_LINE_SIZE);
-    if (!this_conn_tbl)
-        return EDPVS_NOMEM;
-
-    for (i = 0; i < DPVS_CONN_TBL_SIZE; i++)
-        INIT_LIST_HEAD(&this_conn_tbl[i]);
+        for (i = 0; i < DPVS_CONN_TBL_SIZE; i++)
+            INIT_LIST_HEAD(&this_conn_tbl[nsid][i]);
 
 #ifdef CONFIG_DPVS_IPVS_CONN_LOCK
-    rte_spinlock_init(&this_conn_lock);
+        rte_spinlock_init(&this_conn_lock);
 #endif
-    this_conn_count = 0;
+        this_conn_count[nsid] = 0;
+
+    }
 
     return EDPVS_OK;
 }
@@ -1223,17 +1230,19 @@ static int conn_init_lcore(void *arg)
 static int conn_term_lcore(void *arg)
 {
     lcoreid_t cid = rte_lcore_id();
+    nsid_t nsid;
 
     if (cid >= DPVS_MAX_LCORE)
         return EDPVS_IDLE;
 
     if (!rte_lcore_is_enabled(cid))
         return EDPVS_DISABLED;
-
-    if (this_conn_tbl) {
-        conn_flush();
-        rte_free(this_conn_tbl);
-        this_conn_tbl = NULL;
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        if (this_conn_tbl[nsid]) {
+            conn_flush(nsid);
+            rte_free(this_conn_tbl[nsid]);
+            this_conn_tbl[nsid] = NULL;
+        }
     }
 
     return EDPVS_OK;
@@ -1252,7 +1261,7 @@ struct ip_vs_conn_array_list {
     ipvs_conn_entry_t array[0];
 };
 
-static struct list_head conn_to_dump;
+static struct list_head conn_to_dump[DPVS_MAX_NETNS];
 
 static inline char* get_conn_state_name(uint16_t proto, uint16_t state)
 {
@@ -1398,7 +1407,7 @@ static int sockopt_conn_get_specified(const struct ip_vs_conn_req *conn_req,
     int res;
 
     if (conn_req->flag & GET_IPVS_CONN_FLAG_TEMPLATE) {
-        conn = dp_vs_ct_in_get(conn_req->sockpair.af, conn_req->sockpair.proto,
+        conn = dp_vs_ct_in_get(conn_req->nsid, conn_req->sockpair.af, conn_req->sockpair.proto,
                 &conn_req->sockpair.sip, &conn_req->sockpair.tip,
                 conn_req->sockpair.sport, conn_req->sockpair.tport);
         if (unlikely(conn != NULL)) { /* hit persist conn */
@@ -1442,7 +1451,7 @@ static int sockopt_conn_get_specified(const struct ip_vs_conn_req *conn_req,
 /* call me on the same lcore as the conn table,
  * lock me if the conn table is global
  * */
-static int __lcore_conn_table_dump(const struct list_head *cplist)
+static int __lcore_conn_table_dump(nsid_t nsid, const struct list_head *cplist)
 {
     int i;
     struct conn_tuple_hash *tuphash;
@@ -1468,7 +1477,7 @@ static int __lcore_conn_table_dump(const struct list_head *cplist)
                         "%p:%d-%d\n", __func__, cparr->tail - cparr->head, cparr,
                         cparr->head, cparr->tail);
 #endif
-                list_add_tail(&cparr->ca_list, &conn_to_dump);
+                list_add_tail(&cparr->ca_list, &conn_to_dump[nsid]);
             }
         }
     }
@@ -1478,7 +1487,7 @@ static int __lcore_conn_table_dump(const struct list_head *cplist)
                 "%p:%d-%d\n", __func__, cparr->tail - cparr->head, cparr,
                 cparr->head, cparr->tail);
 #endif
-        list_add_tail(&cparr->ca_list, &conn_to_dump);
+        list_add_tail(&cparr->ca_list, &conn_to_dump[nsid]);
     }
     return EDPVS_OK;
 }
@@ -1490,12 +1499,13 @@ static int sockopt_conn_get_all(const struct ip_vs_conn_req *conn_req,
     struct ip_vs_conn_array_list *larr, *next_larr;
     struct dpvs_msg *msg;
     lcoreid_t cid = conn_req->whence;
+    nsid_t nsid = conn_req->nsid;
 
 again:
-    list_for_each_entry_safe(larr, next_larr, &conn_to_dump, ca_list) {
+    list_for_each_entry_safe(larr, next_larr, &conn_to_dump[nsid], ca_list) {
 #ifdef CONFIG_DPVS_IPVS_STATS_DEBUG
         RTE_LOG(DEBUG, IPVS, "%s: printing conn_to_dump list(len=%d) --"
-                "%p:%d-%d\n", __func__, list_elems(&conn_to_dump), larr,
+                "%p:%d-%d\n", __func__, list_elems(&conn_to_dump[nsid]), larr,
                 larr->head, larr->tail);
 #endif
         n = larr->tail - larr->head;
@@ -1534,9 +1544,9 @@ again:
 
     if ((conn_req->flag & GET_IPVS_CONN_FLAG_TEMPLATE)
             && (cid == rte_get_main_lcore())) { /* persist conns */
-        rte_spinlock_lock(&dp_vs_ct_lock);
-        res = __lcore_conn_table_dump(dp_vs_ct_tbl);
-        rte_spinlock_unlock(&dp_vs_ct_lock);
+        rte_spinlock_lock(&dp_vs_ct_lock[nsid]);
+        res = __lcore_conn_table_dump(nsid, dp_vs_ct_tbl[nsid]);
+        rte_spinlock_unlock(&dp_vs_ct_lock[nsid]);
         if (res != EDPVS_OK) {
             conn_arr->nconns = got;
             conn_arr->resl = GET_IPVS_CONN_RESL_FAIL;
@@ -1565,7 +1575,7 @@ again:
     }
 
     /* get conns table from cid and saved into dump list */
-    msg = msg_make(MSG_TYPE_CONN_GET_ALL, 0, DPVS_MSG_UNICAST, rte_lcore_id(), 0, NULL);
+    msg = msg_make(MSG_TYPE_CONN_GET_ALL, 0, DPVS_MSG_UNICAST, rte_lcore_id(), sizeof(nsid_t), &conn_req->nsid);
     /* FIXME: When conns in session table are not many enough, blockable msg would get
      * timeout probably due to the traverse of the whole huge session table.  So non-
      * blockable msg is used. A more elegant solution is to use an upper time limit for
@@ -1623,7 +1633,7 @@ static int sockopt_conn_get(sockoptid_t opt, const void *in, size_t inlen,
                 return EDPVS_INVAL;
             if (!(conn_req->flag & GET_IPVS_CONN_FLAG_MORE)) {
                 struct ip_vs_conn_array_list *calst, *tcalst;
-                list_for_each_entry_safe(calst, tcalst, &conn_to_dump, ca_list) {
+                list_for_each_entry_safe(calst, tcalst, &conn_to_dump[conn_req->nsid], ca_list) {
                     list_del_init(&calst->ca_list);
                     rte_free(calst);
                 }
@@ -1673,11 +1683,11 @@ static int conn_get_msgcb_slave(struct dpvs_msg *msg)
     if (conn_req->flag & GET_IPVS_CONN_FLAG_TEMPLATE)
         return EDPVS_INVAL;
 
-    conn = dp_vs_conn_get(conn_req->sockpair.af, conn_req->sockpair.proto,
+    conn = dp_vs_conn_get(conn_req->nsid, conn_req->sockpair.af, conn_req->sockpair.proto,
             &conn_req->sockpair.sip, &conn_req->sockpair.tip,
             conn_req->sockpair.sport, conn_req->sockpair.tport, &dir, 0);
     if (!conn) {
-        conn = dp_vs_conn_get(conn_req->sockpair.af, conn_req->sockpair.proto,
+        conn = dp_vs_conn_get(conn_req->nsid, conn_req->sockpair.af, conn_req->sockpair.proto,
                 &conn_req->sockpair.sip, &conn_req->sockpair.tip,
                 conn_req->sockpair.sport, conn_req->sockpair.tport, &dir, 1);
     }
@@ -1710,7 +1720,10 @@ static int conn_get_msgcb_slave(struct dpvs_msg *msg)
 
 static int conn_get_all_msgcb_slave(struct dpvs_msg *msg)
 {
-    return  __lcore_conn_table_dump(this_conn_tbl);
+    nsid_t nsid;
+    assert(msg->len == sizeof(nsid_t));
+    nsid = *(nsid_t *)msg->data;
+    return  __lcore_conn_table_dump(nsid, this_conn_tbl[nsid]);
 }
 
 static int register_conn_get_msg(void)
@@ -1791,8 +1804,10 @@ static int unregister_conn_get_msg(void)
 static int conn_ctrl_init(void)
 {
     int err;
-
-    INIT_LIST_HEAD(&conn_to_dump);
+    nsid_t nsid;
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        INIT_LIST_HEAD(&conn_to_dump[nsid]);
+    }
 
     if ((err = register_conn_get_msg()) != EDPVS_OK)
         return err;
@@ -1809,10 +1824,12 @@ static int conn_ctrl_init(void)
 static void conn_ctrl_term(void)
 {
     struct ip_vs_conn_array_list *calst, *tcalst;
-
-    list_for_each_entry_safe(calst, tcalst, &conn_to_dump, ca_list) {
-        list_del_init(&calst->ca_list);
-        rte_free(calst);
+    nsid_t nsid;
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        list_for_each_entry_safe(calst, tcalst, &conn_to_dump[nsid], ca_list) {
+            list_del_init(&calst->ca_list);
+            rte_free(calst);
+        }
     }
 
     sockopt_unregister(&conn_sockopts);
@@ -1824,20 +1841,23 @@ int dp_vs_conn_init(void)
     int i, err;
     lcoreid_t lcore;
     char poolname[32];
+    nsid_t nsid;
 
     /* init connection template table */
-    dp_vs_ct_tbl = rte_malloc(NULL, sizeof(struct list_head) * DPVS_CONN_TBL_SIZE,
-            RTE_CACHE_LINE_SIZE);
-    if (!dp_vs_ct_tbl) {
-        err = EDPVS_NOMEM;
-        RTE_LOG(WARNING, IPVS, "%s: %s.\n",
-            __func__, dpvs_strerror(err));
-        return err;
-    }
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        dp_vs_ct_tbl[nsid] = rte_malloc(NULL, sizeof(struct list_head) * DPVS_CONN_TBL_SIZE,
+                RTE_CACHE_LINE_SIZE);
+        if (!dp_vs_ct_tbl[nsid]) {
+            err = EDPVS_NOMEM;
+            RTE_LOG(WARNING, IPVS, "%s: %s.\n",
+                __func__, dpvs_strerror(err));
+            return err;
+        }
 
-    for (i = 0; i < DPVS_CONN_TBL_SIZE; i++)
-        INIT_LIST_HEAD(&dp_vs_ct_tbl[i]);
-    rte_spinlock_init(&dp_vs_ct_lock);
+        for (i = 0; i < DPVS_CONN_TBL_SIZE; i++)
+            INIT_LIST_HEAD(&dp_vs_ct_tbl[nsid][i]);
+        rte_spinlock_init(&dp_vs_ct_lock[nsid]);
+    }
 
     /*
      * unlike linux per_cpu() which can assign CPU number,
@@ -1858,7 +1878,7 @@ int dp_vs_conn_init(void)
     for (i = 0; i < get_numa_nodes(); i++) {
         snprintf(poolname, sizeof(poolname), "dp_vs_conn_%d", i);
         dp_vs_conn_cache[i] = rte_mempool_create(poolname,
-                                    conn_pool_size,
+                                    conn_pool_size*DPVS_MAX_NETNS,
                                     sizeof(struct dp_vs_conn),
                                     conn_pool_cache,
                                     0, NULL, NULL, NULL, NULL,

@@ -42,6 +42,7 @@
 #ifndef __DPVS_SA_POOL__
 #define __DPVS_SA_POOL__
 
+#include "conf/common.h"
 #include "netif_flow.h"
 
 #define MAX_PORT            65536
@@ -114,11 +115,11 @@ int sa_pool_destroy(struct inet_ifaddr *ifa);
  * @dev and @daddr is optional,
  * note: if @daddr is used, it must be the same for sa_fetch and sa_release.
  */
-int sa_fetch(int af, struct netif_port *dev,
+int sa_fetch(nsid_t nsid, int af, struct netif_port *dev,
              const struct sockaddr_storage *daddr,
              struct sockaddr_storage *saddr);
 
-int sa_release(const struct netif_port *dev,
+int sa_release(nsid_t nsid, const struct netif_port *dev,
                const struct sockaddr_storage *daddr,
                const struct sockaddr_storage *saddr);
 

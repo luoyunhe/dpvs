@@ -22,6 +22,7 @@
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "route6.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/proto.h"
@@ -150,7 +151,7 @@ int udp_send_csum(int af, int iphdrlen, struct rte_udp_hdr *uh,
     return EDPVS_OK;
 }
 
-static int udp_conn_sched(struct dp_vs_proto *proto,
+static int udp_conn_sched(nsid_t nsid, struct dp_vs_proto *proto,
                         const struct dp_vs_iphdr *iph,
                         struct rte_mbuf *mbuf,
                         struct dp_vs_conn **conn,
@@ -167,7 +168,7 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
     }
 
     /* lookup service <vip:vport> */
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr,
+    svc = dp_vs_service_lookup(nsid, iph->af, iph->proto, &iph->daddr,
                      uh->dst_port, 0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
@@ -181,7 +182,7 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
         int err = quic_parse_server(mbuf, iph, &qsvr);
         if (likely(err == EDPVS_OK)) {
             if (qsvr.wildcard > 0) {
-                *conn = quic_schedule(svc, &qsvr, iph, mbuf);
+                *conn = quic_schedule(nsid, svc, &qsvr, iph, mbuf);
                 if (*conn)
                     RTE_LOG(INFO, IPVS, "schedule new connection from quic cid\n");
                 else {
@@ -196,7 +197,7 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
         }
     }
     if (!*conn) {
-        *conn = dp_vs_schedule(svc, iph, mbuf, false);
+        *conn = dp_vs_schedule(nsid, svc, iph, mbuf, false);
         if (!*conn) {
             *verdict = INET_DROP;
             return EDPVS_RESOURCE;
@@ -222,7 +223,7 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
 }
 
 static struct dp_vs_conn *
-udp_conn_lookup(struct dp_vs_proto *proto,
+udp_conn_lookup(nsid_t nsid, struct dp_vs_proto *proto,
                 const struct dp_vs_iphdr *iph,
                 struct rte_mbuf *mbuf, int *direct,
                 bool reverse, bool *drop, lcoreid_t *peer_cid)
@@ -247,7 +248,7 @@ udp_conn_lookup(struct dp_vs_proto *proto,
         return NULL;
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto,
                           &iph->saddr, &iph->daddr,
                           uh->src_port, uh->dst_port,
                           direct, reverse);
@@ -265,7 +266,7 @@ udp_conn_lookup(struct dp_vs_proto *proto,
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto,
                                &iph->saddr, &iph->daddr,
                                uh->src_port, uh->dst_port);
         if (r) {
@@ -336,6 +337,7 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     struct opphdr *opp;
     int iaf = tuplehash_in(conn).af;
     int oaf = tuplehash_out(conn).af;
+    nsid_t nsid = conn->nsid;
 
     assert(conn && ombuf && oiph && ouh &&
             MBUF_USERDATA_CONST(ombuf, void *, MBUF_FIELD_ROUTE));
@@ -454,14 +456,14 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
         rt6 = MBUF_USERDATA_CONST(ombuf, struct route6 *, MBUF_FIELD_ROUTE);
         MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE) = rt6;
         route6_get(rt6);
-        return ip6_local_out(mbuf);
+        return ip6_local_out(nsid, mbuf);
     } else { /* IPv4 */
         struct route_entry *rt;
         uh->check  = 0; /* rte_ipv4_udptcp_cksum fails if opp inserted. */
         rt = MBUF_USERDATA_CONST(ombuf, struct route_entry *, MBUF_FIELD_ROUTE);
         MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
         route4_get(rt);
-        return ipv4_local_out(mbuf);
+        return ipv4_local_out(nsid, mbuf);
     }
 
 no_room:

@@ -36,10 +36,10 @@ void install_ipv4_keywords(void);
  */
 /* 'flow4.daddr' & 'flow4.proto' is mandatory
  * while others are not. '0/NULL' for wildcard. */
-int ipv4_xmit(struct rte_mbuf *mbuf, const struct flow4 *fl4);
+int ipv4_xmit(nsid_t nsid, struct rte_mbuf *mbuf, const struct flow4 *fl4);
 
 /* call after fill IP headers and LOCAL_OUT hook */
-int ipv4_output(struct rte_mbuf *mbuf);
+int ipv4_output(nsid_t nsid, struct rte_mbuf *mbuf);
 
 /*
  * Transport Protocols
@@ -47,7 +47,7 @@ int ipv4_output(struct rte_mbuf *mbuf);
 struct inet_protocol {
     /* mbuf userdata (MBUF_FIELD_PROTO) can be used to get IPv4 header,
      * save it if protocols need mbuf userdata (MBUF_FIELD_PROTO) for other purpose. */
-    int (*handler)(struct rte_mbuf *mbuf);
+    int (*handler)(nsid_t nsid, struct rte_mbuf *mbuf);
 };
 
 int ipv4_register_protocol(struct inet_protocol *prot,
@@ -118,8 +118,8 @@ int ipv4_get_stats(struct ip4_stats *stats);
 int ip4_defrag(struct rte_mbuf *mbuf, int user);
 
 uint32_t ip4_select_id(struct rte_ipv4_hdr *iph);
-int ipv4_local_out(struct rte_mbuf *mbuf);
-int ipv4_rcv_fin(struct rte_mbuf *mbuf);
+int ipv4_local_out(nsid_t nsid, struct rte_mbuf *mbuf);
+int ipv4_rcv_fin(nsid_t nsid, struct rte_mbuf *mbuf);
 
 /* helper functions */
 static inline struct rte_ipv4_hdr *ip4_hdr(const struct rte_mbuf *mbuf)

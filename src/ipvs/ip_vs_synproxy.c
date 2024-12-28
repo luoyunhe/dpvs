@@ -26,6 +26,7 @@
 #include "dpdk.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/synproxy.h"
+#include "namespace.h"
 #include "timer.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -732,7 +733,7 @@ static void syn_proxy_reuse_mbuf(int af, struct rte_mbuf *mbuf,
  * @return 0 means the caller should return at once and use
  * verdict as return value, return 1 for nothing.
  */
-int dp_vs_synproxy_syn_rcv(int af, struct rte_mbuf *mbuf,
+int dp_vs_synproxy_syn_rcv(nsid_t nsid, int af, struct rte_mbuf *mbuf,
         const struct dp_vs_iphdr *iph, int *verdict)
 {
     int ret;
@@ -748,12 +749,12 @@ int dp_vs_synproxy_syn_rcv(int af, struct rte_mbuf *mbuf,
         goto syn_rcv_out;
 
     if (th->syn && !th->ack && !th->rst && !th->fin &&
-            (svc = dp_vs_service_lookup(af, iph->proto, &iph->daddr, th->dest, 0,
+            (svc = dp_vs_service_lookup(nsid, af, iph->proto, &iph->daddr, th->dest, 0,
                 NULL, NULL, rte_lcore_id())) && (svc->flags & DP_VS_SVC_F_SYNPROXY)) {
         /* if service's weight is zero (non-active realserver),
          * do noting and drop the packet */
         if (svc->weight == 0) {
-            dp_vs_estats_inc(SYNPROXY_NO_DEST);
+            dp_vs_estats_inc(nsid, SYNPROXY_NO_DEST);
             goto syn_rcv_out;
         }
 
@@ -778,7 +779,7 @@ int dp_vs_synproxy_syn_rcv(int af, struct rte_mbuf *mbuf,
         goto syn_rcv_out;
 
     /* update statistics */
-    dp_vs_estats_inc(SYNPROXY_SYN_CNT);
+    dp_vs_estats_inc(nsid, SYNPROXY_SYN_CNT);
 
     /* set tx offload flags */
     assert(mbuf->port <= NETIF_MAX_PORTS);
@@ -1188,7 +1189,7 @@ static int syn_proxy_send_tcp_rst(int af, struct rte_mbuf *mbuf)
 /* Syn-proxy step 2 logic: receive client's Ack
  * Receive client's 3-handshakes ack packet, do cookie check and then
  * send syn to rs after creating a session */
-int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
+int dp_vs_synproxy_ack_rcv(nsid_t nsid, int af, struct rte_mbuf *mbuf,
         struct tcphdr *th, struct dp_vs_proto *pp,
         struct dp_vs_conn **cpp,
         const struct dp_vs_iphdr *iph, int *verdict)
@@ -1200,12 +1201,12 @@ int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
 
     /* Do not check svc syn-proxy flag, as it may be changed after syn-proxy step 1. */
     if (!th->syn && th->ack && !th->rst && !th->fin &&
-            (svc = dp_vs_service_lookup(af, iph->proto, &iph->daddr,
+            (svc = dp_vs_service_lookup(nsid, af, iph->proto, &iph->daddr,
                            th->dest, 0, NULL, NULL, rte_lcore_id()))) {
         if (dp_vs_synproxy_ctrl_defer &&
                 !syn_proxy_ack_has_data(mbuf, iph, th)) {
             /* Update statistics */
-            dp_vs_estats_inc(SYNPROXY_NULL_ACK);
+            dp_vs_estats_inc(nsid, SYNPROXY_NULL_ACK);
             /* We get a pure ack when expecting ack packet with payload, so
              * have to drop it */
             *verdict = INET_DROP;
@@ -1220,7 +1221,7 @@ int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
                     ntohl(th->ack_seq) - 1, &opt);
         if (!res_cookie_check) {
             /* Update statistics */
-            dp_vs_estats_inc(SYNPROXY_BAD_ACK);
+            dp_vs_estats_inc(nsid, SYNPROXY_BAD_ACK);
             /* Cookie check failed, drop the packet */
             RTE_LOG(DEBUG, IPVS, "%s: syn_cookie check failed seq=%u\n", __func__,
                     ntohl(th->ack_seq) - 1);
@@ -1233,11 +1234,11 @@ int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
         }
 
         /* Update statistics */
-        dp_vs_estats_inc(SYNPROXY_OK_ACK);
+        dp_vs_estats_inc(nsid, SYNPROXY_OK_ACK);
 
         /* Let the virtual server select a real server for the incoming connetion,
          * and create a connection entry */
-        *cpp = dp_vs_schedule(svc, iph, mbuf, 1);
+        *cpp = dp_vs_schedule(nsid, svc, iph, mbuf, 1);
         if (unlikely(!*cpp)) {
             RTE_LOG(WARNING, IPVS, "%s: ip_vs_schedule failed\n", __func__);
             /* FIXME: What to do when virtual service is available but no destination
@@ -1625,6 +1626,7 @@ int dp_vs_synproxy_reuse_conn(int af, struct rte_mbuf *mbuf,
     int res_cookie_check;
     uint32_t tcp_conn_reuse_states = 0;
     int ret;
+    nsid_t nsid = cp->nsid;
 
     th = mbuf_header_pointer(mbuf, iph->len, sizeof(_tcph), &_tcph);
     if (unlikely(!th)) {
@@ -1651,7 +1653,7 @@ int dp_vs_synproxy_reuse_conn(int af, struct rte_mbuf *mbuf,
                     ntohl(th->ack_seq) - 1, &opt);
         if (!res_cookie_check) {
             /* Update statistics */
-            dp_vs_estats_inc(SYNPROXY_BAD_ACK);
+            dp_vs_estats_inc(nsid, SYNPROXY_BAD_ACK);
             /* Cookie check fail, let it go.
              * Attention: Do not drop the packet here! Do not print any log here.
              *            Because the session's last ACK may arrive here.*/
@@ -1659,24 +1661,24 @@ int dp_vs_synproxy_reuse_conn(int af, struct rte_mbuf *mbuf,
         }
 
         /* Update statistics */
-        dp_vs_estats_inc(SYNPROXY_OK_ACK);
-        dp_vs_estats_inc(SYNPROXY_CONN_REUSED);
+        dp_vs_estats_inc(nsid, SYNPROXY_OK_ACK);
+        dp_vs_estats_inc(nsid, SYNPROXY_CONN_REUSED);
 
         switch (cp->old_state) {
         case DPVS_TCP_S_CLOSE:
-            dp_vs_estats_inc(SYNPROXY_CONN_REUSED_CLOSE);
+            dp_vs_estats_inc(nsid, SYNPROXY_CONN_REUSED_CLOSE);
             break;
         case DPVS_TCP_S_TIME_WAIT:
-            dp_vs_estats_inc(SYNPROXY_CONN_REUSED_TIMEWAIT);
+            dp_vs_estats_inc(nsid, SYNPROXY_CONN_REUSED_TIMEWAIT);
             break;
         case DPVS_TCP_S_FIN_WAIT:
-            dp_vs_estats_inc(SYNPROXY_CONN_REUSED_FINWAIT);
+            dp_vs_estats_inc(nsid, SYNPROXY_CONN_REUSED_FINWAIT);
             break;
         case DPVS_TCP_S_CLOSE_WAIT:
-            dp_vs_estats_inc(SYNPROXY_CONN_REUSED_CLOSEWAIT);
+            dp_vs_estats_inc(nsid, SYNPROXY_CONN_REUSED_CLOSEWAIT);
             break;
         case DPVS_TCP_S_LAST_ACK:
-            dp_vs_estats_inc(SYNPROXY_CONN_REUSED_LASTACK);
+            dp_vs_estats_inc(nsid, SYNPROXY_CONN_REUSED_LASTACK);
             break;
         }
 
@@ -1717,7 +1719,7 @@ static int syn_proxy_is_ack_storm(struct tcphdr *tcph, struct dp_vs_conn *cp)
         if (rte_atomic32_read(&cp->dup_ack_cnt) >= dp_vs_synproxy_ctrl_dup_ack_thresh) {
             rte_atomic32_set(&cp->dup_ack_cnt, dp_vs_synproxy_ctrl_dup_ack_thresh);
             /* Update statisitcs */
-            dp_vs_estats_inc(SYNPROXY_ACK_STORM);
+            dp_vs_estats_inc(cp->nsid, SYNPROXY_ACK_STORM);
             return 0;
         }
 
@@ -1781,7 +1783,7 @@ int dp_vs_synproxy_filter_ack(struct rte_mbuf *mbuf, struct dp_vs_conn *cp,
         /* the length of ack list should be limited to avoid pktpool resource drained
          * when we does not recieve rs's reply to our syn in no time */
         if (dp_vs_synproxy_ctrl_max_ack_saved < cp->ack_num) {
-            dp_vs_estats_inc(SYNPROXY_SYNSEND_QLEN);
+            dp_vs_estats_inc(cp->nsid, SYNPROXY_SYNSEND_QLEN);
             sp_dbg_stats64_inc(sp_ack_refused);
             *verdict = INET_DROP;
             return 0;
