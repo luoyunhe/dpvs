@@ -15,8 +15,10 @@
  * GNU General Public License for more details.
  *
  */
+#include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include "conf/common.h"
 #include "route.h"
 #include "conf/route.h"
 #include "ctrl.h"
@@ -31,8 +33,8 @@
 #define this_num_routes         (RTE_PER_LCORE(num_routes))
 #define this_route_lcore        (RTE_PER_LCORE(route_lcore))
 
-#define this_local_route_table  (this_route_lcore.local_route_table)
-#define this_net_route_table    (this_route_lcore.net_route_table)
+#define this_local_route_table(nsid)  (this_route_lcore[nsid].local_route_table)
+#define this_net_route_table(nsid)    (this_route_lcore[nsid].net_route_table)
 
 /**
  * use per-lcore structure for lockless
@@ -43,8 +45,8 @@ struct route_lcore {
     struct list_head net_route_table;
 };
 
-static RTE_DEFINE_PER_LCORE(struct route_lcore, route_lcore);
-static RTE_DEFINE_PER_LCORE(rte_atomic32_t, num_routes);
+static RTE_DEFINE_PER_LCORE(struct route_lcore[DPVS_MAX_NETNS], route_lcore);
+static RTE_DEFINE_PER_LCORE(rte_atomic32_t[DPVS_MAX_NETNS], num_routes);
 
 static int route_msg_seq(void)
 {
@@ -68,11 +70,11 @@ route_local_hashkey(uint32_t ip_addr, const struct netif_port *port)
     return rte_be_to_cpu_32(ip_addr)&LOCAL_ROUTE_TAB_MASK;
 }
 
-static int route_local_hash(struct route_entry *route)
+static int route_local_hash(nsid_t nsid, struct route_entry *route)
 {
     unsigned hashkey;
     hashkey = route_local_hashkey(route->dest.s_addr, route->port);
-    list_add(&route->list, &this_local_route_table[hashkey]);
+    list_add(&route->list, &this_local_route_table(nsid)[hashkey]);
     rte_atomic32_inc(&route->refcnt);
     return EDPVS_OK;
 }
@@ -112,12 +114,12 @@ static struct route_entry *route_new_entry(struct in_addr* dest,
 
 }
 
-static int route_net_add(struct in_addr *dest, uint8_t netmask, uint32_t flag,
+static int route_net_add(nsid_t nsid, struct in_addr *dest, uint8_t netmask, uint32_t flag,
                          struct in_addr *gw, struct netif_port *port,
-                         struct in_addr *src, unsigned long mtu,short metric)
+                         struct in_addr *src, unsigned long mtu, short metric)
 {
     struct route_entry *route_node, *route;
-    struct list_head *route_table = &this_net_route_table;
+    struct list_head *route_table = &this_net_route_table(nsid);
 
     list_for_each_entry(route_node, route_table, list){
         if (net_cmp(port, dest->s_addr, netmask, route_node)
@@ -132,7 +134,7 @@ static int route_net_add(struct in_addr *dest, uint8_t netmask, uint32_t flag,
             }
             __list_add(&route->list, (&route_node->list)->prev,
                        &route_node->list);
-            rte_atomic32_inc(&this_num_routes);
+            rte_atomic32_inc(&this_num_routes[nsid]);
             rte_atomic32_inc(&route->refcnt);
             return EDPVS_OK;
         }
@@ -143,17 +145,17 @@ static int route_net_add(struct in_addr *dest, uint8_t netmask, uint32_t flag,
         return EDPVS_NOMEM;
     }
     list_add_tail(&route->list, route_table);
-    rte_atomic32_inc(&this_num_routes);
+    rte_atomic32_inc(&this_num_routes[nsid]);
     rte_atomic32_inc(&route->refcnt);
     return EDPVS_OK;
 }
 
-static struct route_entry *route_local_lookup(uint32_t dest, const struct netif_port *port)
+static struct route_entry *route_local_lookup(nsid_t nsid, uint32_t dest, const struct netif_port *port)
 {
     unsigned hashkey;
     struct route_entry *route_node;
     hashkey = route_local_hashkey(dest, port);
-    list_for_each_entry(route_node, &this_local_route_table[hashkey], list){
+    list_for_each_entry(route_node, &this_local_route_table(nsid)[hashkey], list){
         if ((dest == route_node->dest.s_addr)
                 && (port ? (port->id == route_node->port->id) : true)) {
             rte_atomic32_inc(&route_node->refcnt);
@@ -163,12 +165,12 @@ static struct route_entry *route_local_lookup(uint32_t dest, const struct netif_
     return NULL;
 }
 
-struct route_entry *route_out_local_lookup(uint32_t dest)
+struct route_entry *route_out_local_lookup(nsid_t nsid, uint32_t dest)
 {
     unsigned hashkey;
     struct route_entry *route_node;
     hashkey = route_local_hashkey(dest, NULL);
-    list_for_each_entry(route_node, &this_local_route_table[hashkey], list){
+    list_for_each_entry(route_node, &this_local_route_table(nsid)[hashkey], list){
         if (dest == route_node->dest.s_addr){
             rte_atomic32_inc(&route_node->refcnt);
             return route_node;
@@ -177,11 +179,11 @@ struct route_entry *route_out_local_lookup(uint32_t dest)
     return NULL;
 }
 
-static struct route_entry *route_net_lookup(struct netif_port *port,
+static struct route_entry *route_net_lookup(nsid_t nsid, struct netif_port *port,
                                             struct in_addr *dest, uint8_t netmask)
 {
     struct route_entry *route_node;
-    list_for_each_entry(route_node, &this_net_route_table, list){
+    list_for_each_entry(route_node, &this_net_route_table(nsid), list){
         if (net_cmp(port, dest->s_addr, netmask, route_node)){
             rte_atomic32_inc(&route_node->refcnt);
             return route_node;
@@ -190,11 +192,11 @@ static struct route_entry *route_net_lookup(struct netif_port *port,
     return NULL;
 }
 
-static struct route_entry *route_in_net_lookup(const struct netif_port *port,
+static struct route_entry *route_in_net_lookup(nsid_t nsid, const struct netif_port *port,
                                                const struct in_addr *dest)
 {
     struct route_entry *route_node;
-    list_for_each_entry(route_node, &this_net_route_table, list){
+    list_for_each_entry(route_node, &this_net_route_table(nsid), list){
         if (net_cmp(route_node->port, dest->s_addr, route_node->netmask, route_node)){
             rte_atomic32_inc(&route_node->refcnt);
             return route_node;
@@ -203,10 +205,10 @@ static struct route_entry *route_in_net_lookup(const struct netif_port *port,
     return NULL;
 }
 
-static struct route_entry *route_out_net_lookup(const struct in_addr *dest)
+static struct route_entry *route_out_net_lookup(nsid_t nsid, const struct in_addr *dest)
 {
     struct route_entry *route_node;
-    list_for_each_entry(route_node, &this_net_route_table, list){
+    list_for_each_entry(route_node, &this_net_route_table(nsid), list){
         if (net_cmp(route_node->port, dest->s_addr, route_node->netmask, route_node)){
             rte_atomic32_inc(&route_node->refcnt);
             return route_node;
@@ -215,7 +217,7 @@ static struct route_entry *route_out_net_lookup(const struct in_addr *dest)
     return NULL;
 }
 
-static int route_local_add(struct in_addr* dest, uint8_t netmask, uint32_t flag,
+static int route_local_add(nsid_t nsid, struct in_addr* dest, uint8_t netmask, uint32_t flag,
                            struct in_addr* gw, struct netif_port *port,
                            struct in_addr* src, unsigned long mtu,short metric)
 {
@@ -223,7 +225,7 @@ static int route_local_add(struct in_addr* dest, uint8_t netmask, uint32_t flag,
     struct route_entry *route_node, *route;
 
     hashkey = route_local_hashkey(*(uint32_t *)(dest),NULL);
-    list_for_each_entry(route_node, &this_local_route_table[hashkey], list){
+    list_for_each_entry(route_node, &this_local_route_table(nsid)[hashkey], list){
         if (net_cmp(port, dest->s_addr, netmask, route_node)
              && (dest->s_addr == route_node->dest.s_addr) ){
             return EDPVS_EXIST;
@@ -235,22 +237,22 @@ static int route_local_add(struct in_addr* dest, uint8_t netmask, uint32_t flag,
     if (!route){
         return EDPVS_NOMEM;
     }
-    route_local_hash(route);
-    rte_atomic32_inc(&this_num_routes);
+    route_local_hash(nsid, route);
+    rte_atomic32_inc(&this_num_routes[nsid]);
     return EDPVS_OK;
 }
 
-static int route_add_lcore(struct in_addr* dest,uint8_t netmask, uint32_t flag,
+static int route_add_lcore(nsid_t nsid, struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric)
 {
 
     if((flag & RTF_LOCALIN) || (flag & RTF_KNI))
-        return route_local_add(dest, netmask, flag, gw,
+        return route_local_add(nsid, dest, netmask, flag, gw,
 			      port, src, mtu, metric);
 
     if((flag & RTF_FORWARD) || (flag & RTF_DEFAULT))
-        return route_net_add(dest, netmask, flag, gw,
+        return route_net_add(nsid, dest, netmask, flag, gw,
                              port, src, mtu, metric);
    
 
@@ -265,30 +267,30 @@ static int route_add_lcore(struct in_addr* dest,uint8_t netmask, uint32_t flag,
  * 3, find route and ref it will +1;
  * 4, put route will -1;
  */
-static int route_del_lcore(struct in_addr* dest,uint8_t netmask, uint32_t flag,
+static int route_del_lcore(nsid_t nsid, struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric)
 {
     struct route_entry *route = NULL;
 
     if(flag & RTF_LOCALIN || (flag & RTF_KNI)){
-        route = route_local_lookup(dest->s_addr, port);
+        route = route_local_lookup(nsid, dest->s_addr, port);
         if (!route)
             return EDPVS_NOTEXIST;
         list_del(&route->list);
         rte_atomic32_dec(&route->refcnt);
-        rte_atomic32_dec(&this_num_routes);
+        rte_atomic32_dec(&this_num_routes[nsid]);
         route4_put(route);
         return EDPVS_OK;
     }
 
     if(flag & RTF_FORWARD || (flag & RTF_DEFAULT)){
-        route = route_net_lookup(port, dest, netmask);
+        route = route_net_lookup(nsid, port, dest, netmask);
         if (!route)
             return EDPVS_NOTEXIST;
         list_del(&route->list);
         rte_atomic32_dec(&route->refcnt);
-        rte_atomic32_dec(&this_num_routes);
+        rte_atomic32_dec(&this_num_routes[nsid]);
         route4_put(route);
         return EDPVS_OK;
     }
@@ -296,7 +298,7 @@ static int route_del_lcore(struct in_addr* dest,uint8_t netmask, uint32_t flag,
     return EDPVS_INVAL;
 }
 
-static int route_add_del(bool add, struct in_addr* dest,
+static int route_add_del(nsid_t nsid, bool add, struct in_addr* dest,
                          uint8_t netmask, uint32_t flag,
                          struct in_addr* gw, struct netif_port *port,
                          struct in_addr* src, unsigned long mtu,
@@ -314,9 +316,9 @@ static int route_add_del(bool add, struct in_addr* dest,
 
     /* set route on master lcore first */
     if (add)
-        err = route_add_lcore(dest, netmask, flag, gw, port, src, mtu, metric);
+        err = route_add_lcore(nsid, dest, netmask, flag, gw, port, src, mtu, metric);
     else
-        err = route_del_lcore(dest, netmask, flag, gw, port, src, mtu, metric);
+        err = route_del_lcore(nsid, dest, netmask, flag, gw, port, src, mtu, metric);
 
     if (err != EDPVS_OK && err != EDPVS_EXIST && err != EDPVS_NOTEXIST) {
         RTE_LOG(INFO, ROUTE, "[%s] fail to set route -- %s\n",
@@ -337,6 +339,7 @@ static int route_add_del(bool add, struct in_addr* dest,
         cf.src.in = *src;
     cf.mtu = mtu;
     cf.metric = metric;
+    cf.nsid = nsid;
 
     if (add)
         msg = msg_make(MSG_TYPE_ROUTE_ADD, route_msg_seq(), DPVS_MSG_MULTICAST,
@@ -354,21 +357,21 @@ static int route_add_del(bool add, struct in_addr* dest,
     return EDPVS_OK;
 }
 
-int route_add(struct in_addr* dest,uint8_t netmask, uint32_t flag,
+int route_add(nsid_t nsid, struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric)
 {
-    return route_add_del(true, dest, netmask, flag, gw, port, src, mtu, metric);
+    return route_add_del(nsid, true, dest, netmask, flag, gw, port, src, mtu, metric);
 }
 
-int route_del(struct in_addr* dest,uint8_t netmask, uint32_t flag,
+int route_del(nsid_t nsid, struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric)
 {
-    return route_add_del(false, dest, netmask, flag, gw, port, src, mtu, metric);
+    return route_add_del(nsid, false, dest, netmask, flag, gw, port, src, mtu, metric);
 }
 
-struct route_entry *route4_input(const struct rte_mbuf *mbuf,
+struct route_entry *route4_input(nsid_t nsid, const struct rte_mbuf *mbuf,
                                 const struct in_addr *daddr,
                                 const struct in_addr *saddr,
                                 uint8_t tos,//service type
@@ -376,12 +379,12 @@ struct route_entry *route4_input(const struct rte_mbuf *mbuf,
                                 )
 {
     struct route_entry *route;
-    route = route_local_lookup(daddr->s_addr, port);
+    route = route_local_lookup(nsid, daddr->s_addr, port);
     if (route){
         return route;
     }
 
-    route = route_in_net_lookup(port, daddr);
+    route = route_in_net_lookup(nsid, port, daddr);
     if (route){
         return route;
     }
@@ -389,22 +392,22 @@ struct route_entry *route4_input(const struct rte_mbuf *mbuf,
     return NULL;
 }
 
-struct route_entry *route4_local(uint32_t src, struct netif_port *port)
+struct route_entry *route4_local(nsid_t nsid, uint32_t src, struct netif_port *port)
 {
     struct route_entry *route;
-    route = route_local_lookup(src, port);
+    route = route_local_lookup(nsid, src, port);
     if (route && ((route->flag & RTF_LOCALIN) || (route->flag & RTF_KNI))) {
         return route;
     }
     return NULL;
 }
 
-uint32_t route_select_addr(struct netif_port *port)
+uint32_t route_select_addr(nsid_t nsid, struct netif_port *port)
 {
     struct route_entry *route_node;
     unsigned hashkey;
     for(hashkey = 0; hashkey < LOCAL_ROUTE_TAB_SIZE; hashkey++){
-        list_for_each_entry(route_node, &this_local_route_table[hashkey], list){
+        list_for_each_entry(route_node, &this_local_route_table(nsid)[hashkey], list){
             if((port->id == route_node->port->id) && (route_node->flag & RTF_LOCALIN)){
                 return *(uint32_t *)(&route_node->dest);
             }
@@ -413,17 +416,17 @@ uint32_t route_select_addr(struct netif_port *port)
     return 0;
 }
 
-struct route_entry *route4_output(const struct flow4 *fl4)
+struct route_entry *route4_output(nsid_t nsid, const struct flow4 *fl4)
 {
     struct route_entry *route;
 
 
-    route = route_out_local_lookup(fl4->fl4_daddr.s_addr);
+    route = route_out_local_lookup(nsid, fl4->fl4_daddr.s_addr);
     if(route){
         return route;
     }
 
-    route = route_out_net_lookup(&fl4->fl4_daddr);
+    route = route_out_net_lookup(nsid, &fl4->fl4_daddr);
     if(route){
         return route;
     }
@@ -434,20 +437,22 @@ struct route_entry *route4_output(const struct flow4 *fl4)
 static int route_lcore_flush(void)
 {
     int i = 0;
+    nsid_t nsid;
     struct route_entry *route_node;
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++){
+        for (i = 0; i < LOCAL_ROUTE_TAB_SIZE; i++){
+            list_for_each_entry(route_node, &this_local_route_table(nsid)[i], list){
+                list_del(&route_node->list);
+                rte_atomic32_dec(&this_num_routes[nsid]);
+                route4_put(route_node);
+            }
+        }
 
-    for (i = 0; i < LOCAL_ROUTE_TAB_SIZE; i++){
-        list_for_each_entry(route_node, &this_local_route_table[i], list){
+        list_for_each_entry(route_node, &this_net_route_table(nsid), list){
             list_del(&route_node->list);
-            rte_atomic32_dec(&this_num_routes);
+            rte_atomic32_dec(&this_num_routes[nsid]);
             route4_put(route_node);
         }
-    }
-
-    list_for_each_entry(route_node, &this_net_route_table, list){
-        list_del(&route_node->list);
-        rte_atomic32_dec(&this_num_routes);
-        route4_put(route_node);
     }
     
     return EDPVS_OK;
@@ -470,6 +475,7 @@ static int route_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
     union inet_addr *src, *dst, *gw;
     uint32_t af, plen, metric, mtu; 
     uint32_t flags = 0;
+    nsid_t nsid = detail->nsid;
 
     if (!conf || size != sizeof(*detail))
         return EDPVS_INVAL;
@@ -505,7 +511,7 @@ static int route_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
         /*fallthrough*/
 #endif
     case SOCKOPT_SET_ROUTE_ADD:
-        return route_add(&dst->in, plen, flags,
+        return route_add(nsid, &dst->in, plen, flags,
                      &gw->in, dev, &src->in, mtu, metric);
 
 #ifdef CONFIG_DPVS_AGENT
@@ -513,7 +519,7 @@ static int route_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
         /*fallthrough*/
 #endif
     case SOCKOPT_SET_ROUTE_DEL:
-        return route_del(&dst->in, plen, flags,
+        return route_del(nsid, &dst->in, plen, flags,
                      &gw->in, dev, &src->in, mtu, metric);
 
     case SOCKOPT_SET_ROUTE_SET:
@@ -553,6 +559,7 @@ static int route_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
     struct route_entry *entry;
     struct netif_port *port = NULL;
     int off = 0;
+    nsid_t nsid = ((struct dp_vs_route_detail*)conf)->nsid;
     char *ifname = ((struct dp_vs_route_detail*)conf)->ifname;
     if (ifname[0] != '\0') {
         port = netif_port_get_by_name(ifname);
@@ -563,7 +570,7 @@ static int route_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
         }
     }
 
-    nroute = rte_atomic32_read(&this_num_routes);
+    nroute = rte_atomic32_read(&this_num_routes[nsid]);
     *outsize = sizeof(struct dp_vs_route_conf_array) + nroute * sizeof(struct dp_vs_route_detail);
     *out = rte_calloc(NULL, 1, *outsize, 0);
     if (!(*out))
@@ -572,7 +579,7 @@ static int route_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 
     if (port) {
         for (hash = 0; hash < LOCAL_ROUTE_TAB_SIZE; hash++) {
-            list_for_each_entry(entry, &this_local_route_table[hash], list) {
+            list_for_each_entry(entry, &this_local_route_table(nsid)[hash], list) {
                 if (off >= nroute)
                     break;
                 if (port == entry->port)
@@ -580,7 +587,7 @@ static int route_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
             }
         }
 
-        list_for_each_entry(entry, &this_net_route_table, list) {
+        list_for_each_entry(entry, &this_net_route_table(nsid), list) {
             if (off >= nroute)
                 break;
             if (port == entry->port)
@@ -588,14 +595,14 @@ static int route_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
         }
     } else {
         for (hash = 0; hash < LOCAL_ROUTE_TAB_SIZE; hash++) {
-            list_for_each_entry(entry, &this_local_route_table[hash], list) {
+            list_for_each_entry(entry, &this_local_route_table(nsid)[hash], list) {
                 if (off >= nroute)
                     break;
                 route_fill_conf(AF_INET, &array->routes[off++], entry);
             }
         }
 
-        list_for_each_entry(entry, &this_net_route_table, list) {
+        list_for_each_entry(entry, &this_net_route_table(nsid), list) {
             if (off >= nroute)
                 break;
             route_fill_conf(AF_INET, &array->routes[off++], entry);
@@ -620,11 +627,11 @@ static int route_msg_process(bool add, struct dpvs_msg *msg)
     /* set route config */
     cf = (struct dp_vs_route_conf *)msg->data;
     if (add)
-        err = route_add_lcore(&cf->dst.in, cf->plen, cf->flags,
+        err = route_add_lcore(cf->nsid, &cf->dst.in, cf->plen, cf->flags,
                               &cf->via.in, netif_port_get_by_name(cf->ifname),
                               &cf->src.in, cf->mtu, cf->metric);
     else
-        err = route_del_lcore(&cf->dst.in, cf->plen, cf->flags,
+        err = route_del_lcore(cf->nsid, &cf->dst.in, cf->plen, cf->flags,
                               &cf->via.in, netif_port_get_by_name(cf->ifname),
                               &cf->src.in, cf->mtu, cf->metric);
     if (err != EDPVS_OK && err != EDPVS_EXIST && err != EDPVS_NOTEXIST) {
@@ -671,6 +678,7 @@ static struct dpvs_sockopts route_sockopts = {
 static int route_lcore_init(void *arg)
 {
     int i;
+    nsid_t nsid;
     lcoreid_t cid = rte_lcore_id();
 
     if (cid >= DPVS_MAX_LCORE)
@@ -678,10 +686,11 @@ static int route_lcore_init(void *arg)
 
     if (!rte_lcore_is_enabled(cid))
         return EDPVS_DISABLED;
-
-    for (i = 0; i < LOCAL_ROUTE_TAB_SIZE; i++)
-        INIT_LIST_HEAD(&this_local_route_table[i]);
-    INIT_LIST_HEAD(&this_net_route_table);
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        for (i = 0; i < LOCAL_ROUTE_TAB_SIZE; i++)
+            INIT_LIST_HEAD(&this_local_route_table(nsid)[i]);
+        INIT_LIST_HEAD(&this_net_route_table(nsid));
+    }
 
     return EDPVS_OK;
 }
@@ -704,8 +713,10 @@ int route_init(void)
     int err;
     lcoreid_t cid;
     struct dpvs_msg_type msg_type;
-
-    rte_atomic32_set(&this_num_routes, 0);
+    nsid_t nsid;
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++){
+        rte_atomic32_set(&this_num_routes[nsid], 0);
+    }
     /* master core also need routes */
     rte_eal_mp_remote_launch(route_lcore_init, NULL, CALL_MAIN);
     RTE_LCORE_FOREACH_WORKER(cid) {

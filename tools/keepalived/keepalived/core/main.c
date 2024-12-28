@@ -23,6 +23,8 @@
 #include "config.h"
 
 #include <stdlib.h>
+#include <bits/getopt_core.h>
+#include <stdio.h>
 #include <sys/utsname.h>
 #include <sys/resource.h>
 #include <stdbool.h>
@@ -153,6 +155,7 @@ char *hostname;						/* Initial part of hostname */
 #if HAVE_DECL_CLONE_NEWNET
 static char *override_namespace;			/* If namespace specified on command line */
 #endif
+int nsid;
 
 unsigned child_wait_time = CHILD_WAIT_SECS;		/* Time to wait for children to exit */
 
@@ -1435,6 +1438,7 @@ parse_cmdline(int argc, char **argv)
 #endif
 		{"version",		no_argument,		NULL, 'v'},
 		{"help",		no_argument,		NULL, 'h'},
+		{"nsid",		required_argument,	NULL, 'e'},
 
 		{NULL,			0,			NULL,  0 }
 	};
@@ -1443,7 +1447,7 @@ parse_cmdline(int argc, char **argv)
 	 * of longindex, so we need to ensure that before calling getopt_long(), longindex
 	 * is set to a known invalid value */
 	curind = optind;
-	while (longindex = -1, (c = getopt_long(argc, argv, ":vhlndu:DRS:f:p:i:mM::g::Gt::"
+	while (longindex = -1, (c = getopt_long(argc, argv, ":vhe:lndu:DRS:f:p:i:mM::g::Gt::"
 #if defined _WITH_VRRP_ && defined _WITH_LVS_
 					    "PC"
 #endif
@@ -1494,6 +1498,8 @@ parse_cmdline(int argc, char **argv)
 			usage(argv[0]);
 			exit(0);
 			break;
+		case 'e':
+			sscanf(optarg, "%d", &nsid);
 		case 'l':
 			__set_bit(LOG_CONSOLE_BIT, &debug);
 			reopen_log = true;
@@ -1917,7 +1923,7 @@ keepalived_main(int argc, char **argv)
 	/* Update process name if necessary */
 	if (global_data->process_name)
 		set_process_name(global_data->process_name);
-
+	global_data->nsid = nsid;
 #if HAVE_DECL_CLONE_NEWNET
 	if (override_namespace) {
 		if (global_data->network_namespace) {

@@ -184,6 +184,8 @@ struct ip_vs_stats_user {
 
 /* The argument to IP_VS_SO_GET_INFO */
 struct ip_vs_getinfo {
+    /* ns id */
+    nsid_t              nsid;
     /* version number */
     unsigned int        version;
 

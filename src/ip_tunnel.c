@@ -126,7 +126,7 @@ static int tunnel_bind_dev(struct netif_port *dev)
             .fl4_oif            = tnl->link,
         };
 
-        rt = route4_output(&fl4);
+        rt = route4_output(dev->nsid, &fl4);
         if (rt) {
             linkdev = rt->port;
             route4_put(rt);
@@ -190,6 +190,8 @@ static struct netif_port *tunnel_create(struct ip_tunnel_tab *tab,
         if (!tnl->link) {
             RTE_LOG(WARNING, TUNNEL, "%s: invalid link device\n", __func__);
             tnl->params.link[0] = '\0';
+        } else {
+            dev->nsid = tnl->link->nsid;
         }
     }
 
@@ -840,7 +842,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
         fl4.fl4_tos             = tos;
         fl4.fl4_oif             = tnl->link;
 
-        rt = route4_output(&fl4);
+        rt = route4_output(dev->nsid, &fl4);
         if (!rt) {
             err = EDPVS_NOROUTE;
             goto errout;

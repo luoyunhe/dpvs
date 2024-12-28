@@ -172,6 +172,7 @@ int dp_vs_laddr_bind(struct dp_vs_conn *conn, struct dp_vs_service *svc)
     uint16_t sport = 0;
     struct sockaddr_storage dsin, ssin;
     bool found = false;
+    nsid_t nsid = conn->nsid;
 
     if (!conn || !conn->dest || !svc)
         return EDPVS_INVAL;
@@ -216,7 +217,7 @@ int dp_vs_laddr_bind(struct dp_vs_conn *conn, struct dp_vs_service *svc)
             saddr->sin6_addr = laddr->addr.in6;
         }
 
-        if (sa_fetch(laddr->af, laddr->iface, &dsin, &ssin) != EDPVS_OK) {
+        if (sa_fetch(nsid, laddr->af, laddr->iface, &dsin, &ssin) != EDPVS_OK) {
             char buf[64];
             if (inet_ntop(laddr->af, &laddr->addr, buf, sizeof(buf)) == NULL)
                 snprintf(buf, sizeof(buf), "::");
@@ -290,7 +291,7 @@ int dp_vs_laddr_unbind(struct dp_vs_conn *conn)
         saddr->sin6_port = conn->lport;
     }
 
-    sa_release(conn->local->iface, &dsin, &ssin);
+    sa_release(conn->nsid, conn->local->iface, &dsin, &ssin);
 
     rte_atomic32_dec(&conn->local->conn_counts);
 
@@ -494,6 +495,7 @@ static int laddr_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
     int err, af;
     uint16_t proto, port;
     uint32_t fwmark;
+    nsid_t nsid;
     const struct dp_vs_match *match;
     const union inet_addr *addr;
 #ifdef CONFIG_DPVS_AGENT
@@ -529,6 +531,7 @@ static int laddr_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
         proto  = (uint16_t)laddr_front->proto;
         port   = (uint16_t)laddr_front->port;
         fwmark = (uint32_t)laddr_front->fwmark;
+        nsid   = laddr_front->nsid;
         addr   = &laddr_front->addr;
         match  = &laddr_front->match;
     } else {
@@ -537,13 +540,14 @@ static int laddr_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
         proto  = (uint16_t)laddr_conf->proto;
         port   = (uint16_t)laddr_conf->vport;
         fwmark = (uint32_t)laddr_conf->fwmark;
+        nsid   = laddr_conf->nsid;
         addr   = &laddr_conf->vaddr;
         match  = &laddr_conf->match;
 #ifdef CONFIG_DPVS_AGENT
     }
 #endif
 
-    svc = dp_vs_service_lookup(af, proto, addr, port,
+    svc = dp_vs_service_lookup(nsid, af, proto, addr, port,
             fwmark, NULL, match, rte_lcore_id());
     if (!svc)
         return EDPVS_NOSERV;
@@ -606,7 +610,7 @@ static int agent_get_msg_cb(struct dpvs_msg *msg)
 
     laddr_conf = (struct dp_vs_laddr_front *)msg->data;
     
-    svc = dp_vs_service_lookup(laddr_conf->af, laddr_conf->proto,
+    svc = dp_vs_service_lookup(laddr_conf->nsid, laddr_conf->af, laddr_conf->proto,
                                &laddr_conf->addr, laddr_conf->port,
                                laddr_conf->fwmark, NULL, &laddr_conf->match, cid);
     if (!svc) {
@@ -658,7 +662,7 @@ static int get_msg_cb(struct dpvs_msg *msg)
 
     laddr_conf = (struct dp_vs_laddr_conf *)msg->data;
 
-    svc = dp_vs_service_lookup(laddr_conf->af_s, laddr_conf->proto,
+    svc = dp_vs_service_lookup(laddr_conf->nsid, laddr_conf->af_s, laddr_conf->proto,
                                &laddr_conf->vaddr, laddr_conf->vport,
                                laddr_conf->fwmark, NULL, &laddr_conf->match, cid);
     if (!svc) {
@@ -750,7 +754,7 @@ static int laddr_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
             }
 
             if (cid == rte_get_main_lcore()) {
-                svc = dp_vs_service_lookup(laddr_conf->af_s, laddr_conf->proto,
+                svc = dp_vs_service_lookup(laddr_conf->nsid, laddr_conf->af_s, laddr_conf->proto,
                                            &laddr_conf->vaddr, laddr_conf->vport,
                                            laddr_conf->fwmark, NULL, &laddr_conf->match, cid);
                 if (!svc) {
@@ -842,7 +846,7 @@ static int laddr_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
                 return EDPVS_MSG_FAIL;
             }
 
-            svc = dp_vs_service_lookup(laddr_front->af, laddr_front->proto,
+            svc = dp_vs_service_lookup(laddr_front->nsid, laddr_front->af, laddr_front->proto,
                     &laddr_front->addr, laddr_front->port, laddr_front->fwmark,
                     NULL, &laddr_front->match, rte_get_main_lcore());
             if (!svc) {

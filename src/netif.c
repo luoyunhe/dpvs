@@ -19,13 +19,16 @@
 #include <assert.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <stdio.h>
 #include <sys/ioctl.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
+#include "conf/namespace.h"
 #include "dpdk.h"
 #include "conf/common.h"
 #include "generic/rte_cycles.h"
+#include "namespace.h"
 #include "netif.h"
 #include "netif_addr.h"
 #include "conf/netif_addr.h"
@@ -2559,7 +2562,7 @@ void lcore_process_packets(struct rte_mbuf **mbufs, lcoreid_t cid, uint16_t coun
         /* some protocols like LLDP may still like the originated port */
         MBUF_USERDATA(mbuf, portid_t, MBUF_FIELD_ORIGIN_PORT) = mbuf->port;
 
-        if (dev->type == PORT_TYPE_BOND_SLAVE) {
+        if (unlikely(dev->type == PORT_TYPE_BOND_SLAVE)) {
             dev = dev->bond->slave.master;
             mbuf->port = dev->id;
         }
@@ -4143,7 +4146,7 @@ static void netif_port_init(void)
             port = netif_alloc(pid, sizeof(union netif_bond), ifname, 0, 0, bond_port_setup);
         if (!port)
             rte_exit(EXIT_FAILURE, "Port allocation failed, exiting...\n");
-
+        port->nsid = nsid_get(pid);
         if (netif_port_register(port) < 0)
             rte_exit(EXIT_FAILURE, "Port registration failed, exiting...\n");
     }
@@ -4507,7 +4510,7 @@ static int get_lcore_stats(lcoreid_t cid, void **out, size_t *out_len)
     return EDPVS_OK;
 }
 
-static int get_port_list(void **out, size_t *out_len)
+static int get_port_list(nsid_t nsid, void **out, size_t *out_len)
 {
     int i, cnt = 0;
     size_t len;
@@ -4528,6 +4531,9 @@ static int get_port_list(void **out, size_t *out_len)
 
     for (i = 0; i < NETIF_PORT_TABLE_BUCKETS; i++) {
         list_for_each_entry(port, &port_tab[i], list) {
+            if (nsid != NAMESPACE_ID_ALL && port->nsid != nsid) {
+                continue;
+            } 
             get->idname[cnt].id = port->id;
             snprintf(get->idname[cnt].name, sizeof(get->idname[cnt].name),
                     "%s", port->name);
@@ -4921,7 +4927,9 @@ static int netif_sockopt_get(sockoptid_t opt, const void *in, size_t inlen,
             ret = get_lcore_stats(cid, out, outlen);
             break;
         case SOCKOPT_NETIF_GET_PORT_LIST:
-            ret = get_port_list(out, outlen);
+            if (!in || inlen != sizeof(nsid_t))
+                return EDPVS_INVAL;
+            ret = get_port_list(*(nsid_t *)in, out, outlen);
             break;
         case SOCKOPT_NETIF_GET_PORT_BASIC:
             if (!in)

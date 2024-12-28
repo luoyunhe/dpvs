@@ -23,6 +23,7 @@
 #include "ipv6.h"
 #include "icmp.h"
 #include "icmp6.h"
+#include "namespace.h"
 #include "sa_pool.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/conn.h"
@@ -69,7 +70,7 @@ static inline int dp_vs_fill_iphdr(int af, struct rte_mbuf *mbuf,
  * It create a connection entry according to its template if exists,
  * or selects a server and creates a connection entry plus a template.
  */
-static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
+static struct dp_vs_conn *dp_vs_sched_persist(nsid_t nsid, struct dp_vs_service *svc,
         const struct dp_vs_iphdr *iph, struct rte_mbuf *mbuf, bool is_synproxy_on)
 {
     uint32_t conn_flags;
@@ -112,7 +113,7 @@ static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
 
     if (ports[1] == svc->port) {
         /* regular persistent service: <proto, caddr, 0, vaddr, vport, daddr, dport> */
-        ct = dp_vs_ct_in_get(svc->af, iph->proto, &snet, &iph->daddr, 0, ports[1]);
+        ct = dp_vs_ct_in_get(nsid, svc->af, iph->proto, &snet, &iph->daddr, 0, ports[1]);
         if (!ct || !dp_vs_check_template(ct)) {
             /* no template found, or the dest of the conn template is not available */
             dest = svc->scheduler->schedule(svc, mbuf, iph);
@@ -137,7 +138,7 @@ static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
     } else {
         /* port zero service: <proto, caddr, 0, vaddr, 0, daddr, 0>
          * fw-mark based service: not support */
-        ct = dp_vs_ct_in_get(svc->af, iph->proto, &snet, &iph->daddr, 0, 0);
+        ct = dp_vs_ct_in_get(nsid, svc->af, iph->proto, &snet, &iph->daddr, 0, 0);
         if (!ct || !dp_vs_check_template(ct)) {
             dest = svc->scheduler->schedule(svc, mbuf, iph);
             if (unlikely(NULL == dest)) {
@@ -179,7 +180,7 @@ static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
     return conn;
 }
 
-static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
+static struct dp_vs_conn *dp_vs_snat_schedule(nsid_t nsid, struct dp_vs_dest *dest,
                                        const struct dp_vs_iphdr *iph,
                                        uint16_t *ports,
                                        struct rte_mbuf *mbuf)
@@ -236,7 +237,7 @@ static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
             saddr4->sin_addr = dest->addr.in;
             saddr4->sin_port = 0;
 
-            err = sa_fetch(AF_INET, NULL, &daddr, &saddr);
+            err = sa_fetch(nsid, AF_INET, NULL, &daddr, &saddr);
             if (err != 0)
                 return NULL;
             dp_vs_conn_fill_param(AF_INET, iph->proto, &iph->daddr, &dest->addr,
@@ -255,7 +256,7 @@ static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
             saddr6->sin6_addr = dest->addr.in6;
             saddr6->sin6_port = 0;
 
-            err = sa_fetch(AF_INET6, NULL, &daddr, &saddr);
+            err = sa_fetch(nsid, AF_INET6, NULL, &daddr, &saddr);
             if (err != 0)
                 return NULL;
             dp_vs_conn_fill_param(AF_INET6, iph->proto, &iph->daddr, &dest->addr,
@@ -264,7 +265,7 @@ static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
     }
     conn = dp_vs_conn_new(mbuf, iph, &param, dest, 0);
     if (!conn) {
-        sa_release(NULL, &daddr, &saddr);
+        sa_release(nsid, NULL, &daddr, &saddr);
         return NULL;
     }
 
@@ -283,6 +284,7 @@ struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
     struct dp_vs_conn *conn;
     struct dp_vs_conn_param param;
     uint32_t flags = 0;
+    nsid_t nsid = nsid_get(mbuf->port);
 
     assert(svc && iph && mbuf);
 
@@ -292,7 +294,7 @@ struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
 
     /* persistent service */
     if (svc->flags & DP_VS_SVC_F_PERSISTENT)
-        return dp_vs_sched_persist(svc, iph,  mbuf, is_synproxy_on);
+        return dp_vs_sched_persist(nsid, svc, iph,  mbuf, is_synproxy_on);
 
     dest = svc->scheduler->schedule(svc, mbuf, iph);
     if (!dest) {
@@ -304,7 +306,7 @@ struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
     }
 
     if (dest->fwdmode == DPVS_FWD_MODE_SNAT)
-        return dp_vs_snat_schedule(dest, iph, ports, mbuf);
+        return dp_vs_snat_schedule(nsid, dest, iph, ports, mbuf);
 
     if (unlikely(iph->proto == IPPROTO_ICMP)) {
         struct icmphdr *ich, _icmph;
@@ -445,7 +447,7 @@ static int __xmit_outbound_icmp4(struct rte_mbuf *mbuf,
     fl4.fl4_daddr = conn->caddr.in;
     fl4.fl4_saddr = conn->vaddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         rte_pktmbuf_free(mbuf);
         return EDPVS_NOROUTE;
@@ -558,7 +560,7 @@ static int __xmit_inbound_icmp4(struct rte_mbuf *mbuf,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->laddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         rte_pktmbuf_free(mbuf);
         return EDPVS_NOROUTE;
@@ -1089,21 +1091,23 @@ static int __dp_vs_pre_routing(void *priv, struct rte_mbuf *mbuf,
 {
     struct dp_vs_iphdr iph;
     struct dp_vs_service *svc;
+    nsid_t nsid;
 
     if (EDPVS_OK != dp_vs_fill_iphdr(af, mbuf, &iph))
         return INET_ACCEPT;
 
+    nsid = nsid_get(mbuf->port);
     /* Drop all ip fragment except ospf */
     if ((af == AF_INET) && ip4_is_frag(ip4_hdr(mbuf))) {
-        dp_vs_estats_inc(DEFENCE_IP_FRAG_DROP);
+        dp_vs_estats_inc(nsid, DEFENCE_IP_FRAG_DROP);
         return INET_DROP;
     }
 
     /* Drop udp packet which send to tcp-vip */
     if (g_defence_udp_drop && IPPROTO_UDP == iph.proto) {
-        if ((svc = dp_vs_vip_lookup(af, IPPROTO_UDP, &iph.daddr, rte_lcore_id())) == NULL) {
-            if ((svc = dp_vs_vip_lookup(af, IPPROTO_TCP, &iph.daddr, rte_lcore_id())) != NULL) {
-                dp_vs_estats_inc(DEFENCE_UDP_DROP);
+        if ((svc = dp_vs_vip_lookup(af, IPPROTO_UDP, &iph.daddr, rte_lcore_id(), nsid)) == NULL) {
+            if ((svc = dp_vs_vip_lookup(af, IPPROTO_TCP, &iph.daddr, rte_lcore_id(), nsid)) != NULL) {
+                dp_vs_estats_inc(nsid, DEFENCE_UDP_DROP);
                 return INET_DROP;
             }
         }

@@ -20,6 +20,7 @@
 #include <net/if.h>
 #include <net/ethernet.h>
 #include <stdint.h>
+#include "conf/common.h"
 #include "list.h"
 #include "dpdk.h"
 #include "inetaddr.h"
@@ -210,6 +211,7 @@ struct netif_ops {
 
 struct netif_port {
     char                    name[IFNAMSIZ];  /* device name */
+    nsid_t                  nsid;                       /* namespace id */
     portid_t                id;                         /* device id */
     port_type_t             type;                       /* device type */
     uint16_t                flag;                       /* device flag */

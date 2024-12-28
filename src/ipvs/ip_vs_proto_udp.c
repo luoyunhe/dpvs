@@ -22,6 +22,7 @@
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "route6.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/proto.h"
@@ -167,7 +168,7 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
     }
 
     /* lookup service <vip:vport> */
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr,
+    svc = dp_vs_service_lookup(nsid_get(mbuf->port), iph->af, iph->proto, &iph->daddr,
                      uh->dst_port, 0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
@@ -229,6 +230,7 @@ udp_conn_lookup(struct dp_vs_proto *proto,
 {
     struct rte_udp_hdr *uh, _udph;
     struct dp_vs_conn *conn;
+    nsid_t nsid = nsid_get(mbuf->port);
     assert(proto && iph && mbuf);
 
     uh = mbuf_header_pointer(mbuf, iph->len, sizeof(_udph), &_udph);
@@ -247,7 +249,7 @@ udp_conn_lookup(struct dp_vs_proto *proto,
         return NULL;
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto,
                           &iph->saddr, &iph->daddr,
                           uh->src_port, uh->dst_port,
                           direct, reverse);
@@ -265,7 +267,7 @@ udp_conn_lookup(struct dp_vs_proto *proto,
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto,
                                &iph->saddr, &iph->daddr,
                                uh->src_port, uh->dst_port);
         if (r) {

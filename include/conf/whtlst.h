@@ -21,6 +21,7 @@
  */
 #ifndef __DPVS_WHTLST_CONF_H__
 #define __DPVS_WHTLST_CONF_H__
+#include "conf/common.h"
 #include "inet.h"
 #include "conf/sockopts.h"
 #include "conf/ipset.h"
@@ -35,6 +36,7 @@ typedef struct dp_vs_whtlst_conf {
     uint16_t            vport;
     uint8_t             proto;
     uint8_t             af;
+    nsid_t              nsid;
 
     /* subject and ipset are mutual exclusive */
     union inet_addr     subject;

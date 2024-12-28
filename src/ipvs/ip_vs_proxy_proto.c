@@ -224,7 +224,7 @@ static int proxy_proto_send_standalone(struct proxy_info *ppinfo,
             fl4.fl4_sport = conn->lport;
             fl4.fl4_dport = conn->dport;
             fl4.fl4_proto = conn->proto;
-            rt = route4_output(&fl4);
+            rt = route4_output(conn->nsid, &fl4);
             if (unlikely(!rt))
                 return EDPVS_NOROUTE;
             dev = ((struct route_entry *)rt)->port;

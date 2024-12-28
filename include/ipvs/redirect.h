@@ -48,7 +48,7 @@ struct dp_vs_redirect *dp_vs_redirect_alloc(enum dpvs_fwd_mode fwdmode);
 void dp_vs_redirect_free(struct dp_vs_conn *conn);
 void dp_vs_redirect_hash(struct dp_vs_conn *conn);
 void dp_vs_redirect_unhash(struct dp_vs_conn *conn);
-struct dp_vs_redirect *dp_vs_redirect_get(int af, uint16_t proto,
+struct dp_vs_redirect *dp_vs_redirect_get(nsid_t nsid, int af, uint16_t proto,
     const union inet_addr *saddr, const union inet_addr *daddr,
     uint16_t sport, uint16_t dport);
 void dp_vs_redirect_init(struct dp_vs_conn *conn);

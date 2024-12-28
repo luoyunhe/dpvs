@@ -20,6 +20,7 @@
 /**
  * IPv4/v6 address management
  */
+#include "conf/common.h"
 #include "inet.h"
 #include "netif.h"
 #include "timer.h"
@@ -108,15 +109,15 @@ int inet_addr_del(int af, struct netif_port *dev,
 
 int inet_addr_flush(int af, struct netif_port *dev);
 
-struct netif_port *inet_addr_get_iface(int af, union inet_addr *addr);
+struct netif_port *inet_addr_get_iface(nsid_t nsid, int af, union inet_addr *addr);
 
 void inet_addr_select(int af, const struct netif_port *dev,
                       const union inet_addr *dst, int scope,
                       union inet_addr *addr);
 
-struct inet_ifaddr *inet_addr_ifa_get(int af, const struct netif_port *dev,
+struct inet_ifaddr *inet_addr_ifa_get(nsid_t nsid, int af, const struct netif_port *dev,
                                       union inet_addr *addr);
-struct inet_ifaddr *inet_addr_ifa_get_expired(int af, const struct netif_port *dev,
+struct inet_ifaddr *inet_addr_ifa_get_expired(nsid_t nsid, int af, const struct netif_port *dev,
                                               union inet_addr *addr);
 void inet_addr_ifa_put(struct inet_ifaddr *ifa);
 

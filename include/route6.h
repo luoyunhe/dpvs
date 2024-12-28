@@ -19,6 +19,7 @@
 #define __DPVS_ROUTE6_H__
 
 #include <net/if.h>
+#include "conf/common.h"
 #include "flow.h"
 #include "conf/route6.h"
 
@@ -78,7 +79,7 @@ struct route6_method {
     struct list_head lnode;
     int (*rt6_setup_lcore)(void *);
     int (*rt6_destroy_lcore)(void *);
-    uint32_t (*rt6_count)(void);
+    uint32_t (*rt6_count)(nsid_t nsid);
     int (*rt6_add_lcore)(const struct dp_vs_route6_conf *);
     int (*rt6_del_lcore)(const struct dp_vs_route6_conf *);
     struct route6* (*rt6_get)(const struct dp_vs_route6_conf *);

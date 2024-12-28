@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <linux/if_ether.h>
 #include "list.h"
+#include "namespace.h"
 #include "netif.h"
 #include "netif_addr.h"
 #include "kni.h"
@@ -251,6 +252,7 @@ int vlan_add_dev(struct netif_port *real_dev, const char *ifname,
         err = EDPVS_NOMEM;
         goto out;
     }
+    dev->nsid = nsid_get(real_dev->nsid);
 
     /* inherit features (offloading) and MAC address from real device */
     dev->flag |= real_dev->flag;

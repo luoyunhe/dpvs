@@ -1,6 +1,7 @@
 # configs
 export CONFIG_DPVS_MAX_SOCKET=2
-export CONFIG_DPVS_MAX_LCORE=64
+export CONFIG_DPVS_MAX_LCORE=4
+export CONFIG_DPVS_MAX_NETNS=2
 
 ## modules
 export CONFIG_DPVS_AGENT=n
@@ -10,7 +11,7 @@ export CONFIG_PDUMP=y
 export CONFIG_ICMP_REDIRECT_CORE=n
 
 # debugging and logging
-export CONFIG_DEBUG=n
+export CONFIG_DEBUG=y
 export CONFIG_DPVS_NEIGH_DEBUG=n
 export CONFIG_RECORD_BIG_LOOP=n
 export CONFIG_DPVS_SAPOOL_DEBUG=n

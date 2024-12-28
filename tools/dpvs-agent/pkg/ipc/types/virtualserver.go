@@ -117,6 +117,8 @@ type dpvsDestCheck struct {
 }
 
 type VirtualServerSpec struct {
+	nsid            uint8
+	nop             [7]uint8
 	af              uint32
 	proto           uint8
 	proxyProto      uint8

@@ -152,8 +152,11 @@ void icmp6_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
     struct inet_ifaddr *ifa;
     int room, err;
     int addr_type = 0;
+    struct netif_port *dev = netif_port_get(imbuf->port);
+    assert(dev != NULL);
+    nsid_t nsid = dev->nsid;
 
-    ifa = inet_addr_ifa_get(AF_INET6, netif_port_get(imbuf->port),
+    ifa = inet_addr_ifa_get(nsid, AF_INET6, dev,
                            (union inet_addr *)&iph->ip6_dst);
     if (ifa) {
         saddr = &iph->ip6_dst;

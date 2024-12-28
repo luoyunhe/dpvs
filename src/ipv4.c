@@ -19,7 +19,9 @@
 #include <assert.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "conf/common.h"
 #include "dpdk.h"
+#include "namespace.h"
 #include "netif.h"
 #include "ipv4.h"
 #include "ipv4_frag.h"
@@ -329,9 +331,9 @@ int ipv4_rcv_fin(struct rte_mbuf *mbuf)
     struct route_entry *rt = NULL;
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     eth_type_t etype = mbuf->packet_type; /* FIXME: use other field ? */
-
+    nsid_t nsid = nsid_get(mbuf->port);
     /* input route decision */
-    rt = route4_input(mbuf, (struct in_addr *)&iph->dst_addr,
+    rt = route4_input(nsid, mbuf, (struct in_addr *)&iph->dst_addr,
             (struct in_addr *)&iph->src_addr,
             iph->type_of_service, netif_port_get(mbuf->port));
     if (unlikely(!rt))
@@ -545,15 +547,16 @@ int ipv4_xmit(struct rte_mbuf *mbuf, const struct flow4 *fl4)
 {
     struct route_entry *rt;
     struct rte_ipv4_hdr *iph;
+    nsid_t nsid;
 
     if (!mbuf || !fl4) {
         if (mbuf)
             rte_pktmbuf_free(mbuf);
         return EDPVS_INVAL;
     }
-
+    nsid = nsid_get(mbuf->port);
     /* output route decision: out-dev, source address, ... */
-    rt = route4_output(fl4);
+    rt = route4_output(nsid, fl4);
     /* not support loopback */
     if (!rt || !(rt->flag & RTF_FORWARD)) {
         rte_pktmbuf_free(mbuf);

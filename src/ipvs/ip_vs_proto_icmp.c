@@ -35,6 +35,7 @@
 #include "ipvs/conn.h"
 #include "ipvs/service.h"
 #include "ipvs/redirect.h"
+#include "namespace.h"
 
 /*
  * o ICMP tuple
@@ -83,6 +84,8 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
     int af = iph->af;
     assert(proto && iph && mbuf && conn && verdict);
 
+    nsid_t nsid = nsid_get(mbuf->port);
+
     if (AF_INET6 == af) {
         struct icmp6_hdr _icmph6;
         ich = mbuf_header_pointer(mbuf, iph->len, sizeof(_icmph6),
@@ -98,7 +101,7 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVPKT;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 0, 0,
+    svc = dp_vs_service_lookup(nsid, iph->af, iph->proto, &iph->daddr, 0, 0,
                                mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
@@ -191,6 +194,7 @@ static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
     /* true icmp type/code, used for v4/v6 */
     uint8_t icmp_type = 0;
     uint8_t icmp_code = 0;
+    nsid_t nsid = nsid_get(mbuf->port);
     struct dp_vs_conn *conn;
     assert(proto && iph && mbuf);
 
@@ -233,14 +237,14 @@ static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
         }
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto, &iph->saddr, &iph->daddr,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto, &iph->saddr, &iph->daddr,
                           sport, dport, direct, reverse);
     if (conn) {
         return conn;
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto,
                                &iph->saddr, &iph->daddr,
                                sport, dport);
         if (r) {

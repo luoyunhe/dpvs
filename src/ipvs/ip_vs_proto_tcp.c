@@ -21,6 +21,7 @@
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "route6.h"
 #include "neigh.h"
 #include "ipvs/ipvs.h"
@@ -747,6 +748,7 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
 {
     struct tcphdr *th, _tcph;
     struct dp_vs_service *svc;
+    nsid_t nsid = nsid_get(mbuf->port);
 
     assert(proto && iph && mbuf && conn && verdict);
 
@@ -784,8 +786,8 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         /* Drop tcp packet which is send to vip and !vport */
         if (g_defence_tcp_drop &&
                 (svc = dp_vs_vip_lookup(iph->af, iph->proto,
-                                    &iph->daddr, rte_lcore_id()))) {
-            dp_vs_estats_inc(DEFENCE_TCP_DROP);
+                                    &iph->daddr, rte_lcore_id(), nsid))) {
+            dp_vs_estats_inc(nsid, DEFENCE_TCP_DROP);
             *verdict = INET_DROP;
             return EDPVS_INVPKT;
         }
@@ -794,14 +796,14 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVAL;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, th->dest,
+    svc = dp_vs_service_lookup(nsid, iph->af, iph->proto, &iph->daddr, th->dest,
                                0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         /* Drop tcp packet which is send to vip and !vport */
         if (g_defence_tcp_drop &&
                 (svc = dp_vs_vip_lookup(iph->af, iph->proto,
-                                   &iph->daddr, rte_lcore_id()))) {
-            dp_vs_estats_inc(DEFENCE_TCP_DROP);
+                                   &iph->daddr, rte_lcore_id(), nsid))) {
+            dp_vs_estats_inc(nsid, DEFENCE_TCP_DROP);
             *verdict = INET_DROP;
             return EDPVS_INVPKT;
         }
@@ -825,6 +827,7 @@ tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
 {
     struct tcphdr *th, _tcph;
     struct dp_vs_conn *conn;
+    nsid_t nsid = nsid_get(mbuf->port);
     assert(proto && iph && mbuf);
 
     th = mbuf_header_pointer(mbuf, iph->len, sizeof(_tcph), &_tcph);
@@ -843,7 +846,7 @@ tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
         return NULL;
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto,
             &iph->saddr, &iph->daddr, th->source, th->dest, direct, reverse);
 
     /*
@@ -866,7 +869,7 @@ tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto,
                                &iph->saddr, &iph->daddr,
                                th->source, th->dest);
         if (r) {
@@ -1185,7 +1188,7 @@ struct rte_mempool *get_mbuf_pool(const struct dp_vs_conn *conn, int dir)
                 fl4.fl4_dport = conn->cport;
             }
             fl4.fl4_proto = IPPROTO_TCP;
-            if ((rt = route4_output(&fl4)) == NULL)
+            if ((rt = route4_output(conn->nsid, &fl4)) == NULL)
                 return NULL;
             dev = rt->port;
             route4_put(rt);

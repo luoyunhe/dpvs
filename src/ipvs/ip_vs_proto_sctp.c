@@ -3,6 +3,7 @@
 #include "dpdk.h"
 #include "mbuf.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "route6.h"
 #include "neigh.h"
 #include "ipvs/ipvs.h"
@@ -59,6 +60,7 @@ static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
     struct sctphdr *sh, _sctph;
     struct sctp_chunkhdr *sch, _schunkh;
     struct dp_vs_conn *conn;
+    nsid_t nsid = nsid_get(mbuf->port);
     assert(proto && iph && mbuf);
 
     sh = mbuf_header_pointer(mbuf, iph->len, sizeof(_sctph), &_sctph);
@@ -82,7 +84,7 @@ static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
         return NULL;
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto, &iph->saddr, &iph->daddr,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto, &iph->saddr, &iph->daddr,
                   sh->src_port, sh->dest_port, direct, reverse);
 
     /*
@@ -106,7 +108,7 @@ static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto, &iph->saddr,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto, &iph->saddr,
                        &iph->daddr, sh->src_port,
                        sh->dest_port);
         if (r) {
@@ -133,7 +135,7 @@ static int sctp_conn_schedule(struct dp_vs_proto *proto,
         return EDPVS_INVPKT;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr,
+    svc = dp_vs_service_lookup(nsid_get(mbuf->port), iph->af, iph->proto, &iph->daddr,
                    sh->dest_port, 0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;

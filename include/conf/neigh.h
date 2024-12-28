@@ -20,6 +20,7 @@
 
 #include <arpa/inet.h>
 #include <net/if.h>
+#include "conf/common.h"
 #include "inet.h"
 #include "conf/sockopts.h"
 
@@ -45,6 +46,7 @@ struct dp_vs_neigh_conf {
     char                    ifname[IFNAMSIZ];
     uint8_t                 flag;
     uint8_t                 cid;
+    nsid_t                  nsid;
 }__attribute__((__packed__, aligned(2)));
 
 struct dp_vs_neigh_conf_array {

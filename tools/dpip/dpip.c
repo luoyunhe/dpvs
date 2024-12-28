@@ -21,12 +21,15 @@
 #include <getopt.h>
 #include <linux/socket.h>
 #include <arpa/inet.h>
+#include "conf/namespace.h"
 #include "dpip.h"
 #include "list.h"
 #include "sockopt.h"
 #include "conf/common.h"
 
 static struct list_head dpip_objs = LIST_HEAD_INIT(dpip_objs);
+
+nsid_t g_nsid;
 
 static void usage(void)
 {
@@ -209,12 +212,30 @@ void dpip_unregister_obj(struct dpip_obj *obj)
         list_del(&obj->list);
 }
 
+static void get_nsid_from_env(void){
+    char *endptr;
+    long int value;
+    const char *nsid_str = getenv("NS_ID");
+    if (nsid_str == NULL) {
+        fprintf(stderr, "Please specify NS_ID environment variable\n");
+        exit(-1);
+    }
+    value = strtol(nsid_str, &endptr, 10);
+    if (*endptr || value < 0 || value >= NAMESPACE_MAX_ID) {
+        fprintf(stderr, "Unexpected NS_ID %s\n", nsid_str);
+        exit(-1);
+    }
+    g_nsid = value;
+    return;
+}
+
 int main(int argc, char *argv[])
 {
     char *prog;
     struct dpip_conf conf;
     struct dpip_obj *obj;
     int err;
+    get_nsid_from_env(); 
 
     if ((prog = strchr(argv[0], '/')) != NULL)
         *prog++ = '\0';

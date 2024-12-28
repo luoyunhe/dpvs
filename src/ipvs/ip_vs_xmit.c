@@ -18,6 +18,7 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/icmp6.h>
 #include <assert.h>
+#include "conf/common.h"
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -419,7 +420,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->laddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -619,7 +620,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
     memset(&fl4, 0, sizeof(struct flow4));
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->laddr.in;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -743,7 +744,7 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->caddr.in;
     fl4.fl4_saddr = conn->vaddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1247,7 +1248,7 @@ static int __dp_vs_xmit_dr4(struct dp_vs_proto *proto,
     fl4.fl4_daddr.s_addr = conn->daddr.in.s_addr;
     fl4.fl4_saddr.s_addr = iph->src_addr;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1364,7 +1365,7 @@ static int __dp_vs_xmit_snat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->caddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1524,7 +1525,7 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
         fl4.fl4_saddr = conn->vaddr.in;
         fl4.fl4_tos = iph->type_of_service;
 
-        rt = route4_output(&fl4);
+        rt = route4_output(conn->nsid, &fl4);
         if (!rt) {
             err = EDPVS_NOROUTE;
             goto errout;
@@ -1775,7 +1776,7 @@ static int __dp_vs_xmit_nat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_saddr = conn->caddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -1946,7 +1947,7 @@ static int __dp_vs_out_xmit_nat4(struct dp_vs_proto *proto,
     fl4.fl4_daddr = conn->caddr.in;
     fl4.fl4_saddr = conn->vaddr.in;
     fl4.fl4_tos = iph->type_of_service;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -2117,7 +2118,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
     memset(&fl4, 0, sizeof(struct flow4));
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_tos = tos;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;
@@ -2275,7 +2276,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
     memset(&fl4, 0, sizeof(struct flow4));
     fl4.fl4_daddr = conn->daddr.in;
     fl4.fl4_tos = 0;
-    rt = route4_output(&fl4);
+    rt = route4_output(conn->nsid, &fl4);
     if (!rt) {
         err = EDPVS_NOROUTE;
         goto errout;

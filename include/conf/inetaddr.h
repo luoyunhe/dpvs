@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <linux/if_addr.h>
+#include "conf/common.h"
 #include "inet.h"
 #include "net/if.h"
 #include "conf/sockopts.h"
@@ -60,7 +61,7 @@ struct inet_addr_entry {
     uint8_t             plen;
     uint8_t             scope;
     lcoreid_t           cid;
-    uint8_t             nop;
+    nsid_t              nsid;
 } __attribute__((__packed__));
 
 struct inet_addr_stats {
@@ -73,6 +74,8 @@ struct inet_addr_param {
     ifaddr_ops_t            ifa_ops;
     uint32_t                ifa_ops_flags;
     struct inet_addr_entry  ifa_entry;
+    nsid_t                  nsid;
+    uint8_t                 nop[3]; 
 } __attribute__((__packed__));
 
 struct inet_addr_data {

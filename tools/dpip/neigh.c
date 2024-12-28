@@ -135,7 +135,7 @@ static int neigh_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
 
     if (neigh_parse_args(conf, &neigh) != 0)
         return EDPVS_INVAL;
-
+    neigh.nsid = g_nsid;
     switch (conf->cmd){
     case DPIP_CMD_SHOW:
         err = dpvs_getsockopt(SOCKOPT_GET_NEIGH_SHOW, &neigh, sizeof(neigh),

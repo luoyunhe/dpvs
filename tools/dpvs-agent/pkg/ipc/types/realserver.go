@@ -255,6 +255,9 @@ func (rs *RealServerSpec) Format(kind string) string {
 }
 
 type RealServerFront struct {
+	nsid uint8
+	// 32bit align
+	nop      [3]uint8
 	af       uint32
 	proto    uint16
 	port     uint16

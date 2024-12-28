@@ -19,6 +19,7 @@
 #ifndef __DPVS_ROUTE6_CONF_H__
 #define __DPVS_ROUTE6_CONF_H__
 
+#include "conf/common.h"
 #include "flow.h"
 #include "conf/sockopts.h"
 
@@ -30,6 +31,7 @@ enum {
 };
 
 struct dp_vs_route6_conf {
+    nsid_t              nsid;
     int                 ops;
     rt_addr_t           dst;
     rt_addr_t           src;

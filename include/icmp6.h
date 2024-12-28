@@ -19,6 +19,7 @@
 #ifndef __DPVS_ICMPV6_H__
 #define __DPVS_ICMPV6_H__
 
+#include "conf/common.h"
 #include <netinet/icmp6.h>
 #include <netinet/ip6.h>
 

@@ -19,6 +19,7 @@
 #define __DPVS_STATS_H__
 
 #include <stdint.h>
+#include "conf/common.h"
 #include "dpdk.h"
 #include "conf/stats.h"
 #include "ipvs/service.h"
@@ -91,8 +92,8 @@ int dp_vs_stats_in(struct dp_vs_conn *conn, struct rte_mbuf *mbuf);
 int dp_vs_stats_out(struct dp_vs_conn *conn, struct rte_mbuf *mbuf);
 void dp_vs_stats_conn(struct dp_vs_conn *conn);
 
-void dp_vs_estats_inc(enum dp_vs_estats_type field);
-void dp_vs_estats_clear(void);
-uint64_t dp_vs_estats_get(enum dp_vs_estats_type field);
+void dp_vs_estats_inc(nsid_t nsid, enum dp_vs_estats_type field);
+void dp_vs_estats_clear(nsid_t nsid);
+uint64_t dp_vs_estats_get(nsid_t nsid, enum dp_vs_estats_type field);
 
 #endif /* __DPVS_STATS_H__ */
