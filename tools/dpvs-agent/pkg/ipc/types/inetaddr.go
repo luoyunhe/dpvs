@@ -196,7 +196,7 @@ type InetAddrDetail struct {
 	plen        uint8
 	scope       uint8
 	cid         uint8
-	nop         uint8
+	nsid        uint8
 }
 
 func NewInetAddrDetail() *InetAddrDetail {

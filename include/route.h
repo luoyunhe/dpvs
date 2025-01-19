@@ -40,27 +40,27 @@ struct route_entry {
     rte_atomic32_t refcnt;
 };
 
-struct route_entry *route4_local(uint32_t src, struct netif_port *port);
+struct route_entry *route4_local(nsid_t nsid, uint32_t src, struct netif_port *port);
 
-struct route_entry *route_out_local_lookup(uint32_t dest);
+struct route_entry *route_out_local_lookup(nsid_t nsid, uint32_t dest);
 
-uint32_t route_select_addr(struct netif_port *port);
+uint32_t route_select_addr(nsid_t nsid, struct netif_port *port);
 
-struct route_entry *route4_input(const struct rte_mbuf *mbuf,
+struct route_entry *route4_input(nsid_t nsid, const struct rte_mbuf *mbuf,
                                 const struct in_addr *daddr,
                                 const struct in_addr *saddr,
                                 uint8_t tos,//service type
                                 const struct netif_port *port
                                 );
 
-struct route_entry *route4_output(const struct flow4 *fl4);
+struct route_entry *route4_output(nsid_t nsid, const struct flow4 *fl4);
 
 int route_init(void);
 
 int route_term(void);
 
 // Notes: Flush all routes if `port` is NULL.
-int route_flush(const struct netif_port *port);
+int route_flush(nsid_t nsid, const struct netif_port *port);
 
 static inline void route4_put(struct route_entry *route)
 {
@@ -98,11 +98,11 @@ static inline bool ip_addr_netcmp(uint32_t dest, uint8_t mask,
             (rte_be_to_cpu_32(*(uint32_t *)(&route_node->dest)) & net_mask))?1:0;
 }
 
-int route_add(struct in_addr* dest,uint8_t netmask, uint32_t flag,
+int route_add(nsid_t nsid, struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric);
 
-int route_del(struct in_addr* dest,uint8_t netmask, uint32_t flag,
+int route_del(nsid_t nsid, struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric);
 

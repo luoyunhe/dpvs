@@ -16,6 +16,7 @@
  *
  */
 #include<assert.h>
+#include "conf/common.h"
 #include "route6.h"
 #include "conf/route.h"
 #include "linux_ipv6.h"
@@ -171,16 +172,16 @@ static int rt6_destroy_lcore(void *arg)
     return g_rt6_method->rt6_destroy_lcore(arg);
 }
 
-struct route6 *route6_input(const struct rte_mbuf *mbuf, struct flow6 *fl6)
+struct route6 *route6_input(nsid_t nsid, const struct rte_mbuf *mbuf, struct flow6 *fl6)
 {
     assert(g_rt6_method->rt6_input != NULL);
-    return g_rt6_method->rt6_input(mbuf, fl6);
+    return g_rt6_method->rt6_input(nsid, mbuf, fl6);
 }
 
-struct route6 *route6_output(const struct rte_mbuf *mbuf, struct flow6 *fl6)
+struct route6 *route6_output(nsid_t nsid, const struct rte_mbuf *mbuf, struct flow6 *fl6)
 {
     assert(g_rt6_method->rt6_output != NULL);
-    return g_rt6_method->rt6_output(mbuf, fl6);
+    return g_rt6_method->rt6_output(nsid, mbuf, fl6);
 }
 
 int route6_get(struct route6 *rt)
@@ -280,7 +281,7 @@ static int rt6_add_del_flush(const struct dp_vs_route6_conf *cf)
     return EDPVS_OK;
 }
 
-static int __route6_add_del(const struct in6_addr *dest, int plen, uint32_t flags,
+static int __route6_add_del(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flags,
                             const struct in6_addr *gw, struct netif_port *dev,
                             const struct in6_addr *src, uint32_t mtu, bool add)
 {
@@ -299,24 +300,25 @@ static int __route6_add_del(const struct in6_addr *dest, int plen, uint32_t flag
     cf.src.addr.in6 = *src;
     cf.src.plen = plen;
     cf.mtu      = mtu;
+    cf.nsid     = nsid;
 
     rt6_zero_prefix_tail(&cf.dst);
 
     return rt6_add_del_flush(&cf);
 }
 
-int route6_add(const struct in6_addr *dest, int plen, uint32_t flags,
+int route6_add(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flags,
                const struct in6_addr *gw, struct netif_port *dev,
                const struct in6_addr *src, uint32_t mtu)
 {
-    return __route6_add_del(dest, plen, flags, gw, dev, src, mtu, true);
+    return __route6_add_del(nsid, dest, plen, flags, gw, dev, src, mtu, true);
 }
 
-int route6_del(const struct in6_addr *dest, int plen, uint32_t flags,
+int route6_del(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flags,
                const struct in6_addr *gw, struct netif_port *dev,
                const struct in6_addr *src, uint32_t mtu)
 {
-    return __route6_add_del(dest, plen, flags, gw, dev, src, mtu, false);
+    return __route6_add_del(nsid, dest, plen, flags, gw, dev, src, mtu, false);
 }
 
 int route6_flush(const struct netif_port *dev)
@@ -327,6 +329,7 @@ int route6_flush(const struct netif_port *dev)
 
     cf.ops = RT6_OPS_FLUSH;
     strncpy(cf.ifname, dev->name, sizeof(cf.ifname) - 1);
+    cf.nsid = dev->nsid;
 
     return rt6_add_del_flush(&cf);
 }

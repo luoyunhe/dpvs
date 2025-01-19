@@ -26,6 +26,7 @@
 #define __DPVS_IPV6_H__
 
 #include <netinet/ip6.h>
+#include "conf/common.h"
 #include "rte_mbuf.h"
 #include "linux_ipv6.h"
 #include "flow.h"
@@ -92,17 +93,17 @@ enum {
  * @flags: INET6_PROTO_F_XXX
  */
 struct inet6_protocol {
-    int             (*handler)(struct rte_mbuf *mbuf);
+    int             (*handler)(nsid_t nsid, struct rte_mbuf *mbuf);
     unsigned int    flags;
 };
 
 int ipv6_init(void);
 int ipv6_term(void);
 
-int ipv6_xmit(struct rte_mbuf *mbuf, struct flow6 *fl6);
-int ip6_output(struct rte_mbuf *mbuf);
+int ipv6_xmit(nsid_t nsid, struct rte_mbuf *mbuf, struct flow6 *fl6);
+int ip6_output(nsid_t nsid, struct rte_mbuf *mbuf);
 
-int ip6_local_out(struct rte_mbuf *mbuf);
+int ip6_local_out(nsid_t nsid, struct rte_mbuf *mbuf);
 
 int ipv6_register_hooks(struct inet_hook_ops *ops, size_t n);
 int ipv6_unregister_hooks(struct inet_hook_ops *ops, size_t n);

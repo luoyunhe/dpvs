@@ -15,6 +15,7 @@
  * GNU General Public License for more details.
  *
  */
+#include "conf/common.h"
 #include <netinet/tcp.h>
 /*
  *  DPDK IP Virtual Server Syn-Proxy
@@ -91,11 +92,11 @@ int dp_vs_synproxy_init(void);
 int dp_vs_synproxy_term(void);
 
 /* Syn-proxy step 1 logic: receive client's Syn. */
-int dp_vs_synproxy_syn_rcv(int af, struct rte_mbuf *mbuf,
+int dp_vs_synproxy_syn_rcv(nsid_t nsid, int af, struct rte_mbuf *mbuf,
         const struct dp_vs_iphdr *iph, int *verdict);
 
 /* Syn-proxy step 2 logic: receive client's Ack */
-int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
+int dp_vs_synproxy_ack_rcv(nsid_t nsid, int af, struct rte_mbuf *mbuf,
         struct tcphdr *th, struct dp_vs_proto *pp,
         struct dp_vs_conn **cpp,
         const struct dp_vs_iphdr *iph, int *verdict);

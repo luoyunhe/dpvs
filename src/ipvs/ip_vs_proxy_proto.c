@@ -192,6 +192,7 @@ static int proxy_proto_send_standalone(struct proxy_info *ppinfo,
     struct flow4 fl4;
     struct flow6 fl6;
     uint8_t pp_sent = 1;
+    nsid_t nsid = conn->nsid;
 
     oiph = rte_pktmbuf_mtod(ombuf, void *);
     if (IPPROTO_TCP == conn->proto)
@@ -212,7 +213,7 @@ static int proxy_proto_send_standalone(struct proxy_info *ppinfo,
             fl6.fl6_sport = conn->lport;
             fl6.fl6_dport = conn->dport;
             fl6.fl6_proto = conn->proto;
-            rt = route6_output(NULL, &fl6);
+            rt = route6_output(nsid, NULL, &fl6);
             if (unlikely(!rt))
                 return EDPVS_NOROUTE;
             dev = ((struct route6 *)rt)->rt6_dev;
@@ -224,7 +225,7 @@ static int proxy_proto_send_standalone(struct proxy_info *ppinfo,
             fl4.fl4_sport = conn->lport;
             fl4.fl4_dport = conn->dport;
             fl4.fl4_proto = conn->proto;
-            rt = route4_output(&fl4);
+            rt = route4_output(conn->nsid, &fl4);
             if (unlikely(!rt))
                 return EDPVS_NOROUTE;
             dev = ((struct route_entry *)rt)->port;
@@ -346,7 +347,7 @@ static int proxy_proto_send_standalone(struct proxy_info *ppinfo,
             if (unlikely(EDPVS_OK != err))
                 goto errout;
         }
-        err = ip6_local_out(mbuf);
+        err = ip6_local_out(nsid, mbuf);
         if (err != EDPVS_OK)
             goto errout;
         goto finish;
@@ -371,7 +372,7 @@ static int proxy_proto_send_standalone(struct proxy_info *ppinfo,
                 goto errout;
             }
         }
-        err = ipv4_local_out(mbuf);
+        err = ipv4_local_out(nsid, mbuf);
         if (err != EDPVS_OK)
             goto errout;
         goto finish;

@@ -25,11 +25,11 @@
 #include "ipvs/service.h"
 #include "ipvs/stats.h"
 
-#define this_dpvs_stats             (dpvs_stats[rte_lcore_id()])
-#define this_dpvs_estats            (dpvs_estats[rte_lcore_id()])
+#define this_dpvs_stats(nsid)             (dpvs_stats[rte_lcore_id()][nsid])
+#define this_dpvs_estats(nsid)            (dpvs_estats[rte_lcore_id()][nsid])
 
-static struct dp_vs_stats dpvs_stats[DPVS_MAX_LCORE];
-static struct dp_vs_estats dpvs_estats[DPVS_MAX_LCORE];
+static struct dp_vs_stats dpvs_stats[DPVS_MAX_LCORE][DPVS_MAX_NETNS];
+static struct dp_vs_estats dpvs_estats[DPVS_MAX_LCORE][DPVS_MAX_NETNS];
 
 void dp_vs_stats_clear(struct dp_vs_stats *stats)
 {
@@ -54,6 +54,7 @@ int dp_vs_stats_in(struct dp_vs_conn *conn, struct rte_mbuf *mbuf)
 {
     assert(conn && mbuf);
     struct dp_vs_dest *dest = conn->dest;
+    nsid_t nsid = conn->nsid;
 
     if (dest && dp_vs_dest_is_avail(dest)) {
         /*limit rate*/
@@ -72,8 +73,8 @@ int dp_vs_stats_in(struct dp_vs_conn *conn, struct rte_mbuf *mbuf)
     rte_atomic64_add(&conn->stats.inbytes, mbuf->pkt_len);
 #endif
 
-    this_dpvs_stats.inpkts++;
-    this_dpvs_stats.inbytes += mbuf->pkt_len;
+    this_dpvs_stats(nsid).inpkts++;
+    this_dpvs_stats(nsid).inbytes += mbuf->pkt_len;
     return EDPVS_OK;
 }
 
@@ -81,6 +82,7 @@ int dp_vs_stats_out(struct dp_vs_conn *conn, struct rte_mbuf *mbuf)
 {
     assert(conn && mbuf);
     struct dp_vs_dest *dest = conn->dest;
+    nsid_t nsid = conn->nsid;
 
     if (dest && dp_vs_dest_is_avail(dest)) {
         /*limit rate*/
@@ -99,8 +101,8 @@ int dp_vs_stats_out(struct dp_vs_conn *conn, struct rte_mbuf *mbuf)
     rte_atomic64_add(&conn->stats.outbytes, mbuf->pkt_len);
 #endif
 
-    this_dpvs_stats.outpkts++;
-    this_dpvs_stats.outbytes += mbuf->pkt_len;
+    this_dpvs_stats(nsid).outpkts++;
+    this_dpvs_stats(nsid).outbytes += mbuf->pkt_len;
     return EDPVS_OK;
 }
 
@@ -109,27 +111,29 @@ void dp_vs_stats_conn(struct dp_vs_conn *conn)
     assert(conn && conn->dest);
 
     conn->dest->stats.conns++;
-    this_dpvs_stats.conns++;
+    this_dpvs_stats(conn->nsid).conns++;
 }
 
-void dp_vs_estats_inc(enum dp_vs_estats_type field)
+void dp_vs_estats_inc(nsid_t nsid, enum dp_vs_estats_type field)
 {
-    this_dpvs_estats.mibs[field]++;
+    this_dpvs_estats(nsid).mibs[field]++;
 }
 
-void dp_vs_estats_clear(void)
+void dp_vs_estats_clear(nsid_t nsid)
 {
-    memset(&dpvs_estats[0], 0, sizeof(dpvs_estats));
+    for (lcoreid_t cid = 0; cid < DPVS_MAX_LCORE; cid++)
+        memset(&dpvs_estats[cid][nsid], 0, sizeof(struct dp_vs_estats));
 }
 
-uint64_t dp_vs_estats_get(enum dp_vs_estats_type field)
+uint64_t dp_vs_estats_get(nsid_t nsid, enum dp_vs_estats_type field)
 {
-    return this_dpvs_estats.mibs[field];
+    return this_dpvs_estats(nsid).mibs[field];
 }
 
 int dp_vs_stats_init(void)
 {
-    dp_vs_estats_clear();
+    for (nsid_t nsid = 0; nsid < DPVS_MAX_NETNS; nsid++)
+        dp_vs_estats_clear(nsid);
     srand(rte_rdtsc());
     return EDPVS_OK;
 }

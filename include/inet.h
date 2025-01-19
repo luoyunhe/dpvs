@@ -54,7 +54,7 @@ enum {
     INET_VERDICT_NUM,
 };
 
-typedef int (*inet_hook_fn)(void *priv, struct rte_mbuf *mbuf,
+typedef int (*inet_hook_fn)(nsid_t nsid, void *priv, struct rte_mbuf *mbuf,
                             const struct inet_hook_state *state);
 
 struct inet_hook_ops {
@@ -69,9 +69,9 @@ struct inet_hook_ops {
 
 struct netif_port;
 
-int INET_HOOK(int af, unsigned int hook, struct rte_mbuf *mbuf,
+int INET_HOOK(nsid_t nsid, int af, unsigned int hook, struct rte_mbuf *mbuf,
               struct netif_port *in, struct netif_port *out,
-              int (*okfn)(struct rte_mbuf *mbuf));
+              int (*okfn)(nsid_t nsid, struct rte_mbuf *mbuf));
 
 int inet_init(void);
 int inet_term(void);

@@ -17,12 +17,13 @@
  */
 #ifndef __DPVS_ICMP_H__
 #define __DPVS_ICMP_H__
+#include "conf/common.h"
 #include <netinet/ip_icmp.h>
 
 int icmp_init(void);
 int icmp_term(void);
 
-void icmp_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info);
+void icmp_send(nsid_t nsid, struct rte_mbuf *imbuf, int type, int code, uint32_t info);
 
 #define icmp4_id(icmph)      (((icmph)->un).echo.id)
 

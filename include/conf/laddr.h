@@ -22,6 +22,7 @@
 #ifndef __DPVS_LADDR_CONF_H__
 #define __DPVS_LADDR_CONF_H__
 
+#include "conf/common.h"
 #include "inet.h"
 #include "net/if.h"
 #include "conf/match.h"
@@ -38,6 +39,7 @@ typedef struct dp_vs_laddr_conf {
     /* identify service */
     int                 af_s;
     uint8_t             proto;
+    nsid_t              nsid;
     union inet_addr     vaddr;
     uint16_t            vport;
     uint32_t            fwmark;
@@ -74,6 +76,7 @@ typedef struct dp_vs_laddr_front {
     uint32_t count;
     union inet_addr addr;
     struct dp_vs_match match;
+    nsid_t nsid;
     struct dp_vs_laddr_detail laddrs[0];
 } dpvs_laddr_front_t;
 #endif /* CONFIG_DPVS_AGENT */

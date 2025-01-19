@@ -90,6 +90,7 @@
     *
     */
 
+#include "conf/common.h"
 #undef __KERNEL__	/* Makefile lazyness ;) */
 #include <stdio.h>
 #include <stdlib.h>
@@ -393,6 +394,19 @@ static struct ipvs_command_entry ce = { 0 };
 int main(int argc, char **argv)
 {
     int result;
+    nsid_t nsid;
+    const char *nsid_str = getenv("NS_ID");
+    if (nsid_str == NULL) {
+        fprintf(stderr, "Please specify NS_ID environment variable\n");
+        return -1;
+    }
+    result = string_to_number(nsid_str, 0, INT_MAX);
+    if(result == -1) {
+        fprintf(stderr, "Unable to parse NS_ID %s\n", nsid_str);
+        return -1;
+    }
+    nsid = result;
+    set_nsid(nsid);
 
     if (dpvs_ctrl_init(0)) {
         fail(2, "Can't initialize ipvs: %s\n"
@@ -2030,6 +2044,7 @@ print_service_entry(dpvs_service_compat_t *se, unsigned int format)
         exit(1);
     }
 
+    table->nsid = se->nsid;
     table->index = se->index;
     table->af = se->af;
     table->fwmark = se->fwmark;
@@ -2675,7 +2690,7 @@ static void list_service(dpvs_service_compat_t *svc, unsigned int format)
         fprintf(stderr, "%s\n", ipvs_strerror(errno));
         exit(1);
     }
-
+    get.nsid = get_nsid();
     print_title(format);
     print_service_entry(&get, format);
 }

@@ -19,6 +19,7 @@
 #define __DPVS_ROUTE6_H__
 
 #include <net/if.h>
+#include "conf/common.h"
 #include "flow.h"
 #include "conf/route6.h"
 
@@ -40,19 +41,19 @@ struct route6 {
     rte_atomic32_t      refcnt;
 };
 
-struct route6 *route6_input(const struct rte_mbuf *mbuf, struct flow6 *fl6);
-struct route6 *route6_output(const struct rte_mbuf *mbuf, struct flow6 *fl6);
+struct route6 *route6_input(nsid_t nsid, const struct rte_mbuf *mbuf, struct flow6 *fl6);
+struct route6 *route6_output(nsid_t nsid, const struct rte_mbuf *mbuf, struct flow6 *fl6);
 int route6_get(struct route6 *rt);
 int route6_put(struct route6 *rt);
 
 int route6_init(void);
 int route6_term(void);
 
-int route6_add(const struct in6_addr *dest, int plen, uint32_t flags,
+int route6_add(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flags,
                const struct in6_addr *gw, struct netif_port *dev,
                const struct in6_addr *src, uint32_t mtu);
 
-int route6_del(const struct in6_addr *dest, int plen, uint32_t flags,
+int route6_del(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flags,
                const struct in6_addr *gw, struct netif_port *dev,
                const struct in6_addr *src, uint32_t mtu);
 
@@ -80,13 +81,13 @@ struct route6_method {
     struct list_head lnode;
     int (*rt6_setup_lcore)(void *);
     int (*rt6_destroy_lcore)(void *);
-    uint32_t (*rt6_count)(void);
+    uint32_t (*rt6_count)(nsid_t nsid);
     int (*rt6_add_lcore)(const struct dp_vs_route6_conf *);
     int (*rt6_del_lcore)(const struct dp_vs_route6_conf *);
     int (*rt6_flush_lcore)(const struct dp_vs_route6_conf *);
     struct route6* (*rt6_get)(const struct dp_vs_route6_conf *);
-    struct route6* (*rt6_input)(const struct rte_mbuf *, struct flow6 *);
-    struct route6* (*rt6_output)(const struct rte_mbuf *, struct flow6 *);
+    struct route6* (*rt6_input)(nsid_t nsid, const struct rte_mbuf *, struct flow6 *);
+    struct route6* (*rt6_output)(nsid_t nsid, const struct rte_mbuf *, struct flow6 *);
     struct dp_vs_route6_conf_array* (*rt6_dump)(
             const struct dp_vs_route6_conf *rt6_cfg,
             size_t *nbytes);

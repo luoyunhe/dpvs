@@ -16,11 +16,14 @@
  *
  */
 #include <assert.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
 #include "conf/common.h"
+#include "conf/namespace.h"
 #include "dpip.h"
 #include "conf/netif.h"
 #include "sockopt.h"
@@ -75,23 +78,29 @@ struct link_param
 {
     int verbose;
     int status;
+    int all;
     link_stats_t stats;
     link_device_t dev_type;
     char dev_name[LINK_DEV_NAME_MAXLEN];
     char item[LINK_ARG_ITEM_MAXLEN]; /* for SET cmd */
     char value[LINK_ARG_VALUE_MAXLEN]; /* for SET cmd */
+    char item2[LINK_ARG_ITEM_MAXLEN];
+    char value2[LINK_ARG_VALUE_MAXLEN];
 };
 
 bool g_color = false;
 netif_nic_list_get_t *g_nic_list = NULL;
 
-static inline int get_netif_port_list(void)
+static inline int get_netif_port_list(struct link_param *param)
 {
     int ret;
     size_t len;
     netif_nic_list_get_t *p_port_list = NULL;
-
-    ret = dpvs_getsockopt(SOCKOPT_NETIF_GET_PORT_LIST, NULL, 0,
+    nsid_t nsid = g_nsid;
+    if (param->all) {
+        nsid = NAMESPACE_ID_ALL;
+    }
+    ret = dpvs_getsockopt(SOCKOPT_NETIF_GET_PORT_LIST, &nsid, sizeof(nsid_t),
             (void **)&p_port_list, &len);
     if (EDPVS_OK != ret || !p_port_list || !len) {
         fprintf(stderr, "Fail to get configured NIC list: %s.\n",
@@ -179,6 +188,8 @@ static int link_parse_args(struct dpip_conf *conf,
             param->dev_type = LINK_DEVICE_CPU;
             if (strcmp(conf->argv[0], "cpu") != 0)
                 snprintf(param->dev_name, sizeof(param->dev_name), "%s", conf->argv[0]);
+        } else if (!strncmp(conf->argv[0], "all", 3)) {
+                param->all = 1;
         } else {
             param->dev_type = LINK_DEVICE_NIC;
             snprintf(param->dev_name, sizeof(param->dev_name), "%s", conf->argv[0]);
@@ -199,6 +210,10 @@ static int link_parse_args(struct dpip_conf *conf,
                 snprintf(param->item, sizeof(param->item), "%s", conf->argv[0]);
                 NEXTARG_CHECK(conf, param->item);
                 snprintf(param->value, sizeof(param->value), "%s", conf->argv[0]);
+            } else if (!param->item2[0]) {
+                snprintf(param->item2, sizeof(param->item2), "%s", conf->argv[0]);
+                NEXTARG_CHECK(conf, param->item2);
+                snprintf(param->value2, sizeof(param->value2), "%s", conf->argv[0]);
             }
         }
         NEXTARG(conf);
@@ -735,7 +750,7 @@ static int link_show(struct link_param *param)
             if (param->dev_name[0]) { /* show information of specified NIC */
                 return link_nic_show(param);
             } else { /* show infomation of all NIC */
-                if (get_netif_port_list() != EDPVS_OK)
+                if (get_netif_port_list(param) != EDPVS_OK)
                     return EDPVS_INVAL;
                 ret = EDPVS_OK;
                 for (ii = 0; ii < g_nic_list->nic_num && ii < NETIF_MAX_PORTS; ii++) {
@@ -982,6 +997,13 @@ static int link_nic_set_lldp(const char *name, const char *value)
     return dpvs_setsockopt(SOCKOPT_NETIF_SET_PORT, &cfg, sizeof(netif_nic_set_t));
 }
 
+static int link_add_virtio(struct link_param *param)
+{
+    fprintf(stdout, "todo: create virtio link, name %s, vhost pear %s%s%s\n", param->dev_name, param->value,
+        param->value2[0]?", mac ":"", param->value2);
+    return EDPVS_OK;
+}
+
 static int link_bond_add_bond_slave(const char *name, const char *value)
 {
     netif_bond_set_t cfg;
@@ -1147,6 +1169,12 @@ static int link_add(struct link_param *param)
         {
             if (strcmp(param->item, "bond-slave") == 0)
                 link_bond_add_bond_slave(param->dev_name, param->value);
+            else if (strcmp(param->item, "vhost-peer") == 0 )
+                return link_add_virtio(param);
+            else {
+                fprintf(stderr, "Unexpected add link command.\n");
+                return EDPVS_NOTSUPP;
+            }
             return EDPVS_OK;
         }
         case LINK_DEVICE_CPU:

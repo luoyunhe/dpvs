@@ -19,6 +19,7 @@
  * fragment and reassemble of IPv4 packet.
  */
 #include <assert.h>
+#include "conf/common.h"
 #include "dpdk.h"
 #include "netif.h"
 #include "ipv4.h"
@@ -256,7 +257,7 @@ int ipv4_reassamble(struct rte_mbuf *mbuf)
 }
 
 /* this function consumes mbuf also free route. */
-int ipv4_fragment(struct rte_mbuf *mbuf, unsigned int mtu,
+int ipv4_fragment(nsid_t nsid, struct rte_mbuf *mbuf, unsigned int mtu,
           int (*output)(struct rte_mbuf *))
 {
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
@@ -269,7 +270,7 @@ int ipv4_fragment(struct rte_mbuf *mbuf, unsigned int mtu,
     assert(rt);
 
     if (iph->fragment_offset & RTE_IPV4_HDR_DF_FLAG) {
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
               htonl(mtu));
         err = EDPVS_FRAG;
         goto out;
