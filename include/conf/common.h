@@ -77,6 +77,10 @@ typedef uint32_t    __u32;
 typedef uint8_t lcoreid_t;
 #endif
 
+#ifndef nsid_t
+typedef uint8_t nsid_t;
+#endif
+
 #ifndef portid_t
 typedef uint16_t portid_t;
 #endif

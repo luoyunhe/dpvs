@@ -22,6 +22,7 @@
  * raychen@qiyi.com, Dec 2017, initial.
  */
 #include <assert.h>
+#include "conf/common.h"
 #include "ipv4.h"
 #include "ip_tunnel.h"
 
@@ -68,7 +69,7 @@ static void ipip_setup(struct netif_port *dev)
     tnl->hlen = 0; /* no overhead for IP-in-IP tunnel */
 }
 
-static int ipip_rcv(struct rte_mbuf *mbuf)
+static int ipip_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct iphdr *iph;
     struct ip_tunnel *tnl;

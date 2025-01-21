@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <assert.h>
+#include "conf/common.h"
 #include "inet.h"
 #include "ipvs/service.h"
 #include "ipvs/dest.h"
@@ -43,6 +44,7 @@ struct dest_notification {
     uint16_t dport;
     uint16_t weight;
     uint16_t notification;
+    nsid_t   nsid;
 };
 
 /*
@@ -442,7 +444,7 @@ static struct dp_vs_dest *get_dest_from_notification(const struct dest_notificat
 {
     struct dp_vs_service *svc;
 
-    svc = dp_vs_service_lookup(notice->svc_af, notice->proto, &notice->vaddr, notice->vport,
+    svc = dp_vs_service_lookup(notice->nsid, notice->svc_af, notice->proto, &notice->vaddr, notice->vport,
             0, NULL, NULL, rte_lcore_id());
     if (!svc)
         return NULL;
@@ -737,11 +739,13 @@ static int dp_vs_dest_set(sockoptid_t opt, const void *user, size_t len)
     int i, ret = EDPVS_INVAL;
     msgid_t msg_id = MSG_TYPE_IPVS_RANGE_START;
     lcoreid_t cid;
+    nsid_t nsid;
 
     insvc = (struct dp_vs_dest_front*)user;
     if (len != sizeof(*insvc) + insvc->num_dests*sizeof(struct dp_vs_dest_detail)) {
         return EDPVS_INVAL;
     }
+    nsid = insvc->nsid;
     details = (struct dp_vs_dest_detail*)(user + sizeof(struct dp_vs_dest_front));
 
     cid = rte_lcore_id();
@@ -774,7 +778,7 @@ static int dp_vs_dest_set(sockoptid_t opt, const void *user, size_t len)
         msg_destroy(&msg);
     }
 
-    getsvc = dp_vs_service_lookup(insvc->af, insvc->proto, &insvc->addr, insvc->port, insvc->fwmark, NULL, &insvc->match, cid);
+    getsvc = dp_vs_service_lookup(nsid, insvc->af, insvc->proto, &insvc->addr, insvc->port, insvc->fwmark, NULL, &insvc->match, cid);
     if (!getsvc || getsvc->proto != insvc->proto) {
         return EDPVS_INVAL;
     }
@@ -843,7 +847,7 @@ static int dp_vs_dest_get(sockoptid_t opt, const void *user, size_t len, void **
             }
 
             if (cid == rte_get_main_lcore()) {
-                getsvc = dp_vs_service_lookup(insvc->af, insvc->proto, &insvc->addr, insvc->port, insvc->fwmark, NULL, &insvc->match, cid);
+                getsvc = dp_vs_service_lookup(insvc->nsid, insvc->af, insvc->proto, &insvc->addr, insvc->port, insvc->fwmark, NULL, &insvc->match, cid);
                 if (!getsvc) {
                     msg_destroy(&msg);
                     return EDPVS_NOTEXIST;
@@ -954,7 +958,7 @@ static int dp_vs_dests_get_uc_cb(struct dpvs_msg *msg)
     struct dp_vs_service *svc;
 
     get = (struct dp_vs_dest_front*)msg->data;
-    svc = dp_vs_service_lookup(get->af, get->proto, &get->addr, get->port, get->fwmark, NULL, &get->match, cid);
+    svc = dp_vs_service_lookup(get->nsid, get->af, get->proto, &get->addr, get->port, get->fwmark, NULL, &get->match, cid);
     if (!svc)
         return EDPVS_NOTEXIST;
 

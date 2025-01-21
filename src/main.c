@@ -22,6 +22,11 @@
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#include "namespace.h"
+#include "rte_eal.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #endif
 
 #include <pthread.h>
@@ -160,14 +165,14 @@ static void modules_term(void)
 static int set_all_thread_affinity(void)
 {
     int s;
-    lcoreid_t cid;
+    uint16_t cid;
     pthread_t tid;
     cpu_set_t cpuset;
     unsigned long long cpumask=0;
 
     tid = pthread_self();
     CPU_ZERO(&cpuset);
-    for (cid = 0; cid < RTE_MAX_LCORE; cid++)
+    for (cid = 0; cid < CPU_SETSIZE; cid++)
         CPU_SET(cid, &cpuset);
 
     s = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
@@ -185,7 +190,7 @@ static int set_all_thread_affinity(void)
         return -2;
     }
 
-    for (cid = 0; cid < RTE_MAX_LCORE; cid++) {
+    for (cid = 0; cid < CPU_SETSIZE; cid++) {
         if (CPU_ISSET(cid, &cpuset))
             cpumask |= (1LL << cid);
     }
@@ -276,6 +281,41 @@ static int parse_app_args(int argc, char **argv)
     return ret;
 }
 
+static void add_virtio_dev(void) 
+{
+    char portname[32];
+    char portargs[256];
+    char path[128];
+    int nsid, port_num, i = 0;
+    uint16_t port_id;
+    nsid_init();
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+        for (port_num = 0; port_num < 2; port_num++) {
+            snprintf(path, sizeof(path), "/tmp/vhost-user-ns%d-p%d", nsid, port_num);
+            snprintf(portname, sizeof(portname), "virtio_user-ns%d-p%d", nsid, port_num);
+            // 创建虚拟设备参数，指定路径，设备名称，mac地址等
+            snprintf(portargs, sizeof(portargs), "path=%s,packed_vq=1,server=1,queues=2,queue_size=1024,mac=00:00:00:00:00:%02x", path, i+1);
+                fprintf(stdout, "add vdev %s\n", portname);
+            remove(path);
+            // 把设备加入到系统
+            if (rte_eal_hotplug_add("vdev", portname, portargs) < 0) {
+                fprintf(stderr, "failed to add vdev %s\n", portname);
+                goto exit;
+            }
+            if (rte_eth_dev_get_port_by_name(portname, &port_id) != 0) {
+                fprintf(stderr, "failed to get port by name %s", portname);
+                goto exit;
+            }
+            nsid_set(port_id, nsid);
+            i++;
+        }
+    }
+    return;
+exit:
+    rte_eal_cleanup();
+    exit(EXIT_FAILURE);
+}
+
 int main(int argc, char *argv[])
 {
     int err, nports;
@@ -335,6 +375,8 @@ int main(int argc, char *argv[])
     RTE_LOG(INFO, DPVS, "dpvs-ipc-file: %s\n", dpvs_ipc_file);
 
     rte_timer_subsystem_init();
+
+    add_virtio_dev();
 
     modules_init();
 

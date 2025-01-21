@@ -19,7 +19,9 @@
 #include <assert.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "conf/common.h"
 #include "dpdk.h"
+#include "namespace.h"
 #include "netif.h"
 #include "ipv4.h"
 #include "ipv4_frag.h"
@@ -151,13 +153,13 @@ int ip4_defrag(struct rte_mbuf *mbuf, int user)
     return err;
 }
 
-static int ipv4_local_in_fin(struct rte_mbuf *mbuf)
+static int ipv4_local_in_fin(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     int err, hlen;
     const struct inet_protocol *prot;
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
-    int (*handler)(struct rte_mbuf *mbuf) = NULL;
+    int (*handler)(nsid_t nsid, struct rte_mbuf *mbuf) = NULL;
 
     /* remove network header */
     hlen = ip4_hdrlen(mbuf);
@@ -188,7 +190,7 @@ static int ipv4_local_in_fin(struct rte_mbuf *mbuf)
     rte_spinlock_unlock(&inet_prot_lock);
 
     if (handler) {
-        err = handler(mbuf);
+        err = handler(nsid, mbuf);
         IP4_INC_STATS(indelivers);
     } else {
         err = EDPVS_KNICONTINUE; /* KNI may like it, don't drop */
@@ -198,7 +200,7 @@ static int ipv4_local_in_fin(struct rte_mbuf *mbuf)
     return err;
 }
 
-static int ipv4_local_in(struct rte_mbuf *mbuf)
+static int ipv4_local_in(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     int err;
     struct route_entry *rt;
@@ -211,7 +213,7 @@ static int ipv4_local_in(struct rte_mbuf *mbuf)
         }
     }
 
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_IN, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_IN, mbuf,
             netif_port_get(mbuf->port), NULL, ipv4_local_in_fin);
 }
 
@@ -244,17 +246,17 @@ static int ipv4_output_fin2(struct rte_mbuf *mbuf)
     return err;
 }
 
-static int ipv4_output_fin(struct rte_mbuf *mbuf)
+static int ipv4_output_fin(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
 
     if (mbuf->pkt_len > rt->mtu)
-        return ipv4_fragment(mbuf, rt->mtu, ipv4_output_fin2);
+        return ipv4_fragment(nsid, mbuf, rt->mtu, ipv4_output_fin2);
 
     return ipv4_output_fin2(mbuf);
 }
 
-int ipv4_output(struct rte_mbuf *mbuf)
+int ipv4_output(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
     assert(rt);
@@ -263,19 +265,19 @@ int ipv4_output(struct rte_mbuf *mbuf)
     mbuf->port = rt->port->id;
     iftraf_pkt_out(AF_INET, mbuf, rt->port);
 
-    return INET_HOOK(AF_INET, INET_HOOK_POST_ROUTING, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_POST_ROUTING, mbuf,
             NULL, rt->port, ipv4_output_fin);
 }
 
-static int ipv4_forward_fin(struct rte_mbuf *mbuf)
+static int ipv4_forward_fin(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     IP4_INC_STATS(outforwdatagrams);
     IP4_ADD_STATS(outoctets, mbuf->pkt_len);
 
-    return ipv4_output(mbuf);
+    return ipv4_output(nsid, mbuf);
 }
 
-static int ipv4_forward(struct rte_mbuf *mbuf)
+static int ipv4_forward(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
@@ -284,7 +286,7 @@ static int ipv4_forward(struct rte_mbuf *mbuf)
     assert(rt && rt->port);
 
     if (iph->time_to_live <= 1) {
-        icmp_send(mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+        icmp_send(nsid, mbuf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
         IP4_INC_STATS(inhdrerrors);
         goto drop;
     }
@@ -293,7 +295,7 @@ static int ipv4_forward(struct rte_mbuf *mbuf)
     if (mbuf->pkt_len > mtu
             && (iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG))) {
         IP4_INC_STATS(fragfails);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG, htonl(mtu));
         goto drop;
     }
 
@@ -308,7 +310,7 @@ static int ipv4_forward(struct rte_mbuf *mbuf)
     iph->hdr_checksum = (uint16_t)(csum + (csum >= 0xffff));
     iph->time_to_live--;
 
-    return INET_HOOK(AF_INET, INET_HOOK_FORWARD, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_FORWARD, mbuf,
             netif_port_get(mbuf->port), rt->port, ipv4_forward_fin);
 
 drop:
@@ -323,15 +325,14 @@ static int ip4_rcv_options(struct rte_mbuf *mbuf)
     return EDPVS_OK;
 }
 
-int ipv4_rcv_fin(struct rte_mbuf *mbuf)
+int ipv4_rcv_fin(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     int err;
     struct route_entry *rt = NULL;
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     eth_type_t etype = mbuf->packet_type; /* FIXME: use other field ? */
-
     /* input route decision */
-    rt = route4_input(mbuf, (struct in_addr *)&iph->dst_addr,
+    rt = route4_input(nsid, mbuf, (struct in_addr *)&iph->dst_addr,
             (struct in_addr *)&iph->src_addr,
             iph->type_of_service, netif_port_get(mbuf->port));
     if (unlikely(!rt))
@@ -349,7 +350,7 @@ int ipv4_rcv_fin(struct rte_mbuf *mbuf)
     MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
 
     if (rt->flag & RTF_LOCALIN) {
-        return ipv4_local_in(mbuf);
+        return ipv4_local_in(nsid, mbuf);
     } else if (rt->flag & RTF_KNI) { /* destination is KNI dev's IP */
         route4_put(rt);
         return EDPVS_KNICONTINUE;
@@ -359,7 +360,7 @@ int ipv4_rcv_fin(struct rte_mbuf *mbuf)
             route4_put(rt);
             return EDPVS_KNICONTINUE; /* KNI may like it, don't drop */
         }
-        return ipv4_forward(mbuf);
+        return ipv4_forward(nsid, mbuf);
     } else {
         RTE_LOG(DEBUG, IPV4, "%s: input route has no dst\n", __func__);
         route4_put(rt);
@@ -382,6 +383,8 @@ static int ipv4_rcv(struct rte_mbuf *mbuf, struct netif_port *port)
     uint16_t hlen, len;
     eth_type_t etype = mbuf->packet_type; /* FIXME: use other field ? */
     assert(mbuf);
+    assert(port != NULL);
+    nsid_t nsid = port->nsid;
 
     if (unlikely(etype == ETH_PKT_OTHERHOST || !port)) {
         rte_pktmbuf_free(mbuf);
@@ -443,7 +446,7 @@ static int ipv4_rcv(struct rte_mbuf *mbuf, struct netif_port *port)
     }
 #endif
 
-    return INET_HOOK(AF_INET, INET_HOOK_PRE_ROUTING,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_PRE_ROUTING,
                      mbuf, port, NULL, ipv4_rcv_fin);
 
 csum_error:
@@ -524,7 +527,7 @@ uint32_t ip4_select_id(struct rte_ipv4_hdr *iph)
     return id;
 }
 
-int ipv4_local_out(struct rte_mbuf *mbuf)
+int ipv4_local_out(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt = MBUF_USERDATA(mbuf,
@@ -532,16 +535,16 @@ int ipv4_local_out(struct rte_mbuf *mbuf)
 
     iph->total_length = htons(mbuf->pkt_len);
 
-    if (likely(mbuf->ol_flags & PKT_TX_IP_CKSUM)) {
+    if (likely(mbuf->ol_flags & RTE_MBUF_F_TX_IP_CKSUM)) {
         iph->hdr_checksum = 0;
     } else {
         ip4_send_csum(iph);
     }
-    return INET_HOOK(AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
+    return INET_HOOK(nsid, AF_INET, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt->port, ipv4_output);
 }
 
-int ipv4_xmit(struct rte_mbuf *mbuf, const struct flow4 *fl4)
+int ipv4_xmit(nsid_t nsid, struct rte_mbuf *mbuf, const struct flow4 *fl4)
 {
     struct route_entry *rt;
     struct rte_ipv4_hdr *iph;
@@ -553,7 +556,7 @@ int ipv4_xmit(struct rte_mbuf *mbuf, const struct flow4 *fl4)
     }
 
     /* output route decision: out-dev, source address, ... */
-    rt = route4_output(fl4);
+    rt = route4_output(nsid, fl4);
     /* not support loopback */
     if (!rt || !(rt->flag & RTF_FORWARD)) {
         rte_pktmbuf_free(mbuf);
@@ -588,7 +591,7 @@ int ipv4_xmit(struct rte_mbuf *mbuf, const struct flow4 *fl4)
         iph->src_addr = saddr.in.s_addr;
     }
 
-    return ipv4_local_out(mbuf);
+    return ipv4_local_out(nsid, mbuf);
 }
 
 int ipv4_register_protocol(struct inet_protocol *prot,

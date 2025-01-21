@@ -113,7 +113,7 @@ extern int dpvs_update_dest(dpvs_service_compat_t *svc, dpvs_dest_compat_t *dest
 /* remove a destination server from a service */
 extern int dpvs_del_dest(dpvs_service_compat_t *svc, dpvs_dest_compat_t *dest);
 
-extern struct ip_vs_conn_array *dp_vs_get_conns(const struct ip_vs_conn_req *req);
+extern struct ip_vs_conn_array *dp_vs_get_conns(struct ip_vs_conn_req *req);
 extern struct ip_vs_get_laddrs *dpvs_get_laddrs(dpvs_service_compat_t *svc, struct ip_vs_get_laddrs **laddrs);
 extern int dpvs_add_laddr(dpvs_service_compat_t *svc, dpvs_laddr_table_t *laddr);
 extern int dpvs_del_laddr(dpvs_service_compat_t *svc, dpvs_laddr_table_t *laddr);
@@ -172,5 +172,9 @@ extern void dpvs_sort_dests(dpvs_dest_table_t *d, dpvs_dest_cmp_t f);
 extern int dpvs_cmp_dests(dpvs_dest_compat_t *d1, dpvs_dest_compat_t  *d2);
 
 extern struct dp_vs_whtlst_conf_array *dpvs_get_whtlsts(void);
+
+extern nsid_t get_nsid(void);
+extern void set_nsid(nsid_t nsid);
+
 
 #endif /* _LIBIPVS_H */

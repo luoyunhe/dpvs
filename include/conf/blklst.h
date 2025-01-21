@@ -22,6 +22,7 @@
 #ifndef __DPVS_BLKLST_CONF_H__
 #define __DPVS_BLKLST_CONF_H__
 
+#include "conf/common.h"
 #include "inet.h"
 #include "conf/sockopts.h"
 #include "conf/ipset.h"
@@ -36,6 +37,7 @@ typedef struct dp_vs_blklst_conf {
     uint16_t            vport;
     uint8_t             proto;
     uint8_t             af;
+    nsid_t              nsid;
 
     /* subject and ipset are mutual exclusive */
     union inet_addr     subject;

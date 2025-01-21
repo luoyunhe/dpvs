@@ -22,6 +22,7 @@
  * Lei Chen <raychen@qiyi.com>, initial, Jul 2018.
  */
 #include <netinet/ip6.h>
+#include "conf/common.h"
 #include "ipv6.h"
 
 static int ip6_ext_hdr(__u8 nexthdr)
@@ -120,19 +121,19 @@ drop:
     return -1;
 }
 
-static int ip6_rthdr_rcv(struct rte_mbuf *mbuf)
+static int ip6_rthdr_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     /* TODO: handle route header */
     return ip6_dummy_hdr_rcv(mbuf);
 }
 
-static int ip6_destopt_rcv(struct rte_mbuf *mbuf)
+static int ip6_destopt_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     /* TODO: handle dest option header */
     return ip6_dummy_hdr_rcv(mbuf);
 }
 
-static int ip6_nodata_rcv(struct rte_mbuf *mbuf)
+static int ip6_nodata_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     /* no payload ? just consume it. */
     rte_pktmbuf_free(mbuf);

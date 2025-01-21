@@ -19,6 +19,7 @@
 #define __DPVS_QUICH__
 
 #include <fcntl.h>
+#include "conf/common.h"
 #include "ipvs/service.h"
 #include "conf/inet.h"
 
@@ -173,7 +174,7 @@ int quic_parse_server(const struct rte_mbuf *,
 
 // Schedule a dpvs conn using the backend server specified by qsvr.
 // Return NULL if the backend server doesn't exists in the svc's rs list.
-struct dp_vs_conn* quic_schedule(const struct dp_vs_service *,
+struct dp_vs_conn* quic_schedule(nsid_t nsid, const struct dp_vs_service *,
         const struct quic_server *,
         const struct dp_vs_iphdr *,
         struct rte_mbuf *);

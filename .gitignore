@@ -19,3 +19,9 @@ modules.order
 *.ko
 *.mod.c
 .ycm_extra_conf.py
+.cache
+compile_commands*
+.vscode
+.idea
+tools/keepalived/config.guess
+tools/keepalived/config.sub

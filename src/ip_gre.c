@@ -23,6 +23,7 @@
  */
 #include <assert.h>
 #include <endian.h>
+#include "conf/common.h"
 #include "dpdk.h"
 #include "netif.h"
 #include "ipv4.h"
@@ -261,7 +262,7 @@ static int gre_change(struct netif_port *dev,
     return EDPVS_OK;
 }
 
-static int gre_rcv(struct rte_mbuf *mbuf)
+static int gre_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     int hlen;
     struct iphdr *iph;
@@ -279,7 +280,7 @@ static int gre_rcv(struct rte_mbuf *mbuf)
     tnl = ip_tunnel_lookup(&gre_tunnel_tab, mbuf->port, tpi.flags,
                            iph->saddr, iph->daddr, tpi.key);
     if (!tnl) {
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
+        icmp_send(nsid, mbuf, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
         goto drop;
     }
 

@@ -50,7 +50,7 @@ int dp_vs_term(void);
 
 struct dp_vs_service;
 
-struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
+struct dp_vs_conn *dp_vs_schedule(nsid_t nsid, struct dp_vs_service *svc,
                                   const struct dp_vs_iphdr *iph,
                                   struct rte_mbuf *mbuf,
                                   bool is_synproxy_on);

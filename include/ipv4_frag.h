@@ -18,12 +18,13 @@
 #ifndef __DPVS_IPV4_FRAG_H__
 #define __DPVS_IPV4_FRAG_H__
 
+#include "conf/common.h"
 #define IP4_FRAG_FREE_DEATH_ROW_INTERVAL 100
 
 int ipv4_frag_init(void);
 int ipv4_frag_term(void);
 int ipv4_reassamble(struct rte_mbuf *mbuf);
-int ipv4_fragment(struct rte_mbuf *mbuf, unsigned int mtu,
+int ipv4_fragment(nsid_t nsid, struct rte_mbuf *mbuf, unsigned int mtu,
           int (*output)(struct rte_mbuf *));
 
 void ip4_frag_keyword_value_init(void);

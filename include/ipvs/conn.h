@@ -100,6 +100,7 @@ struct dp_vs_conn {
     struct dpvs_timer       timer;
     struct timeval          timeout;
     lcoreid_t               lcore;
+    nsid_t                  nsid;
     struct dp_vs_dest       *dest;  /* real server */
     void                    *prot_data;  /* protocol specific data */
 
@@ -183,7 +184,7 @@ int dp_vs_conn_init(void);
 int dp_vs_conn_term(void);
 
 struct dp_vs_conn *
-dp_vs_conn_new(struct rte_mbuf *mbuf,
+dp_vs_conn_new(nsid_t nsid, struct rte_mbuf *mbuf,
                const struct dp_vs_iphdr *iph,
                struct dp_vs_conn_param *param,
                struct dp_vs_dest *dest,
@@ -191,14 +192,14 @@ dp_vs_conn_new(struct rte_mbuf *mbuf,
 int dp_vs_conn_del(struct dp_vs_conn *conn);
 
 struct dp_vs_conn *
-dp_vs_conn_get(int af, uint16_t proto,
+dp_vs_conn_get(nsid_t nsid, int af, uint16_t proto,
                 const union inet_addr *saddr,
                 const union inet_addr *daddr,
                 uint16_t sport, uint16_t dport,
                 int *dir, bool reverse);
 
 struct dp_vs_conn *
-dp_vs_ct_in_get(int af, uint16_t proto,
+dp_vs_ct_in_get(nsid_t nsid, int af, uint16_t proto,
                 const union inet_addr *saddr,
                 const union inet_addr *daddr,
                 uint16_t sport, uint16_t dport);

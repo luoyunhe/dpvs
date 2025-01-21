@@ -140,7 +140,7 @@ static int icmp6_is_ineligible(struct rte_mbuf *imbuf)
 }
 
 /* @imbuf is input (original) IP packet to trigger ICMP. */
-void icmp6_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
+void icmp6_send(nsid_t nsid, struct rte_mbuf *imbuf, int type, int code, uint32_t info)
 {
     struct ip6_hdr *iph = ip6_hdr(imbuf);
     eth_type_t etype = imbuf->packet_type; /* FIXME: use other field ? */
@@ -153,7 +153,7 @@ void icmp6_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
     int room, err;
     int addr_type = 0;
 
-    ifa = inet_addr_ifa_get(AF_INET6, netif_port_get(imbuf->port),
+    ifa = inet_addr_ifa_get(nsid, AF_INET6, netif_port_get(imbuf->port),
                            (union inet_addr *)&iph->ip6_dst);
     if (ifa) {
         saddr = &iph->ip6_dst;
@@ -250,14 +250,14 @@ void icmp6_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
     shdr.ip6_plen = htons(room + sizeof(struct icmp6_hdr));
     icmp6_send_csum(&shdr, ich);
 
-    if ((err = ipv6_xmit(mbuf, &fl6)) != EDPVS_OK) {
+    if ((err = ipv6_xmit(nsid, mbuf, &fl6)) != EDPVS_OK) {
         RTE_LOG(DEBUG, ICMP6, "%s: ipv6_xmit: %s.\n",
                 __func__, dpvs_strerror(err));
     }
     return;
 }
 
-static int icmp6_echo_reply(struct rte_mbuf *mbuf, struct ip6_hdr *iph,
+static int icmp6_echo_reply(nsid_t nsid, struct rte_mbuf *mbuf, struct ip6_hdr *iph,
                             struct icmp6_hdr *ich)
 {
     struct ip6_hdr shdr; /* IPv6 header for sending packet */
@@ -293,10 +293,10 @@ static int icmp6_echo_reply(struct rte_mbuf *mbuf, struct ip6_hdr *iph,
 
     icmp6_send_csum(&shdr, ich);
 
-    return ipv6_xmit(mbuf, &fl6);
+    return ipv6_xmit(nsid, mbuf, &fl6);
 }
 
-static int icmp6_rcv(struct rte_mbuf *mbuf)
+static int icmp6_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct ip6_hdr *iph = MBUF_USERDATA(mbuf, struct ip6_hdr *, MBUF_FIELD_PROTO);
     struct icmp6_hdr *ich;
@@ -321,7 +321,7 @@ static int icmp6_rcv(struct rte_mbuf *mbuf)
 #endif
     switch (ich->icmp6_type) {
         case ICMP6_ECHO_REQUEST:
-            return icmp6_echo_reply(mbuf, iph, ich);
+            return icmp6_echo_reply(nsid, mbuf, iph, ich);
 
         case ND_ROUTER_SOLICIT:
         case ND_ROUTER_ADVERT:

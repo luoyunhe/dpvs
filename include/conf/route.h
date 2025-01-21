@@ -22,6 +22,7 @@
 #ifndef __DPVS_ROUTE_CONF_H__
 #define __DPVS_ROUTE_CONF_H__
 
+#include "common.h"
 #include "flow.h"
 #include "inet.h"
 #include "net/if.h"
@@ -48,6 +49,7 @@ enum {
 };
 
 struct dp_vs_route_conf {
+    nsid_t          nsid;
     int             af;
     union inet_addr dst;    /* all-zero for default */
     uint8_t         plen;   /* prefix length */
@@ -63,6 +65,7 @@ struct dp_vs_route_conf {
 } __attribute__((__packed__));
 
 typedef struct dp_vs_route_detail {
+    nsid_t      nsid;
     uint32_t    af;
     uint32_t    mtu;
     uint32_t    flags;

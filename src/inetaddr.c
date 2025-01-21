@@ -17,10 +17,15 @@
  */
 #include <assert.h>
 #include <openssl/sha.h>
+#include <stdint.h>
+#include "conf/common.h"
+#include "conf/namespace.h"
 #include "dpdk.h"
 #include "ctrl.h"
+#include "namespace.h"
 #include "netif.h"
 #include "netif_addr.h"
+#include "rte_ether.h"
 #include "timer.h"
 #include "sa_pool.h"
 #include "ndisc.h"
@@ -37,6 +42,7 @@
 #define INET_ADDR_HSIZE         (1U << INET_ADDR_HSIZE_SHIFT)
 
 struct ifaddr_action {
+    nsid_t              nsid;
     int                 af;
     union inet_addr     addr;
     union inet_addr     bcast;
@@ -50,11 +56,25 @@ struct ifaddr_action {
     ifaddr_ops_t        op;
 };
 
-static struct list_head     inet_addr_tab[DPVS_MAX_LCORE][INET_ADDR_HSIZE];
-static uint32_t             inet_addr_cnt[DPVS_MAX_LCORE];
-static struct list_head     ifa_expired_list[DPVS_MAX_LCORE];
+struct ifaddr_action_get {
+    nsid_t              nsid;
+    struct inet_device *idev;
+};
+
+static struct list_head     inet_addr_tab[DPVS_MAX_LCORE][DPVS_MAX_NETNS][INET_ADDR_HSIZE];
+static uint32_t             inet_addr_cnt[DPVS_MAX_LCORE][DPVS_MAX_NETNS];
+static struct list_head     ifa_expired_list[DPVS_MAX_LCORE][DPVS_MAX_NETNS];
 static uint8_t              slave_workers;
 static uint64_t             slave_worker_mask;
+
+static uint32_t get_ns_inet_addr_cnt(nsid_t nsid, lcoreid_t cid) {
+    uint32_t cnt = 0;
+    if (nsid != NAMESPACE_ID_ALL)
+        return inet_addr_cnt[cid][nsid];
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++)
+        cnt += inet_addr_cnt[cid][nsid];
+    return cnt;
+}
 
 /* forward declarations */
 static void ifa_free(struct inet_ifaddr **ifa_p);
@@ -542,14 +562,14 @@ static struct inet_ifaddr *ifa_lookup(struct inet_device *idev,
     return NULL;
 }
 
-static struct inet_ifaddr *expired_ifa_lookup(struct inet_device *idev,
+static struct inet_ifaddr *expired_ifa_lookup(nsid_t nsid, struct inet_device *idev,
                                               const union inet_addr *addr,
                                               uint8_t plen, int af)
 {
     struct inet_ifaddr *ifa;
     lcoreid_t cid = rte_lcore_id();
 
-    list_for_each_entry(ifa, &ifa_expired_list[cid], h_list) {
+    list_for_each_entry(ifa, &ifa_expired_list[cid][nsid], h_list) {
         if ((!plen || ifa->plen == plen) && (ifa->af == af)
             && inet_addr_equal(af, &ifa->addr, addr)
             && ifa->idev == idev) {
@@ -570,15 +590,15 @@ static void ifa_put(struct inet_ifaddr *ifa)
     }
 }
 
-static void ifa_hash(struct inet_device *idev, struct inet_ifaddr *ifa)
+static void ifa_hash(nsid_t nsid, struct inet_device *idev, struct inet_ifaddr *ifa)
 {
     uint32_t hash;
     lcoreid_t cid = rte_lcore_id();
 
     /* add to global hash table */
     hash = ifa_hash_key(ifa->af, &ifa->addr);
-    list_add(&ifa->h_list, &inet_addr_tab[cid][hash]);
-    ++inet_addr_cnt[cid];
+    list_add(&ifa->h_list, &inet_addr_tab[cid][nsid][hash]);
+    ++inet_addr_cnt[cid][idev->dev->nsid];
 
     /* add to inet_device's list */
     list_add(&ifa->d_list, &idev->ifa_list[cid]);
@@ -587,7 +607,7 @@ static void ifa_hash(struct inet_device *idev, struct inet_ifaddr *ifa)
     rte_atomic32_inc(&ifa->refcnt);
 }
 
-static void ifa_unhash(struct inet_ifaddr *ifa)
+static void ifa_unhash(nsid_t nsid, struct inet_ifaddr *ifa)
 {
     lcoreid_t cid = rte_lcore_id();
 
@@ -600,11 +620,11 @@ static void ifa_unhash(struct inet_ifaddr *ifa)
     INIT_LIST_HEAD(&ifa->d_list);
 
     assert(inet_addr_cnt[cid] > 0 && ifa->idev->ifa_cnt[cid] > 0);
-    --inet_addr_cnt[cid];
+    --inet_addr_cnt[cid][ifa->idev->dev->nsid];
     --ifa->idev->ifa_cnt[cid];
 
     /* move @ifa to @ifa_expired_list, and remove it @ifa_free later */
-    list_add_tail(&ifa->h_list, &ifa_expired_list[cid]);
+    list_add_tail(&ifa->h_list, &ifa_expired_list[cid][nsid]);
 
     /* free sapool when no one is using it.
      * note ifa may free from here. */
@@ -614,7 +634,7 @@ static void ifa_unhash(struct inet_ifaddr *ifa)
     rte_atomic32_dec(&ifa->refcnt);
 }
 
-struct netif_port *inet_addr_get_iface(int af, union inet_addr *addr)
+struct netif_port *inet_addr_get_iface(nsid_t nsid, int af, union inet_addr *addr)
 {
     lcoreid_t cid;
     uint32_t hash;
@@ -623,7 +643,7 @@ struct netif_port *inet_addr_get_iface(int af, union inet_addr *addr)
     cid = rte_lcore_id();
     hash = ifa_hash_key(af, addr);
 
-    list_for_each_entry(ifa, &inet_addr_tab[cid][hash], h_list) {
+    list_for_each_entry(ifa, &inet_addr_tab[cid][nsid][hash], h_list) {
         if (inet_addr_equal(af, &ifa->addr, addr))
             return ifa->idev->dev;
     }
@@ -631,14 +651,14 @@ struct netif_port *inet_addr_get_iface(int af, union inet_addr *addr)
     return NULL;
 }
 
-struct inet_ifaddr *inet_addr_ifa_get(int af, const struct netif_port *dev,
+struct inet_ifaddr *inet_addr_ifa_get(nsid_t nsid, int af, const struct netif_port *dev,
                                       union inet_addr *addr)
 {
     struct inet_ifaddr *ifa;
     struct inet_device *idev;
 
     if (!dev) {
-        dev = inet_addr_get_iface(af, addr);
+        dev = inet_addr_get_iface(nsid, af, addr);
         if (!dev)
             return NULL;
     }
@@ -652,14 +672,14 @@ struct inet_ifaddr *inet_addr_ifa_get(int af, const struct netif_port *dev,
     return ifa;
 }
 
-struct inet_ifaddr *inet_addr_ifa_get_expired(int af, const struct netif_port *dev,
+struct inet_ifaddr *inet_addr_ifa_get_expired(nsid_t nsid, int af, const struct netif_port *dev,
                                               union inet_addr *addr)
 {
     struct inet_ifaddr *ifa;
     struct inet_device *idev;
 
     if (!dev) {
-        dev = inet_addr_get_iface(af, addr);
+        dev = inet_addr_get_iface(nsid, af, addr);
         if (!dev)
             return NULL;
     }
@@ -667,7 +687,7 @@ struct inet_ifaddr *inet_addr_ifa_get_expired(int af, const struct netif_port *d
     idev = dev_get_idev(dev);
     assert(idev != NULL);
 
-    ifa = expired_ifa_lookup(idev, addr, 0, af);
+    ifa = expired_ifa_lookup(nsid, idev, addr, 0, af);
 
     idev_put(idev);
     return ifa;
@@ -727,8 +747,9 @@ static int ifa_add_route4(struct inet_ifaddr *ifa)
 {
     int err;
     union inet_addr net;
+    nsid_t nsid = ifa->idev->dev->nsid;
 
-    err = route_add(&ifa->addr.in, 32, RTF_LOCALIN,
+    err = route_add(nsid, &ifa->addr.in, 32, RTF_LOCALIN,
                     NULL, ifa->idev->dev, NULL, 0, 0);
     if (err != EDPVS_OK && err != EDPVS_EXIST)
         return err;
@@ -740,7 +761,7 @@ static int ifa_add_route4(struct inet_ifaddr *ifa)
     if (ifa->plen == 32)
         return EDPVS_OK;
 
-    err = route_add(&net.in, ifa->plen, RTF_FORWARD,
+    err = route_add(nsid, &net.in, ifa->plen, RTF_FORWARD,
                     NULL, ifa->idev->dev, &ifa->addr.in, 0, 0);
     if (err != EDPVS_OK && err != EDPVS_EXIST)
         goto errout;
@@ -748,7 +769,7 @@ static int ifa_add_route4(struct inet_ifaddr *ifa)
     return EDPVS_OK;
 
 errout:
-    route_del(&ifa->addr.in, ifa->plen, RTF_LOCALIN,
+    route_del(nsid, &ifa->addr.in, ifa->plen, RTF_LOCALIN,
               NULL, ifa->idev->dev, NULL, 0, 0);
     return err;
 }
@@ -757,8 +778,9 @@ static int ifa_add_route6(struct inet_ifaddr *ifa)
 {
     int err;
     struct in6_addr net;
+    nsid_t nsid = ifa->idev->dev->nsid;
 
-    err = route6_add(&ifa->addr.in6, 128, RTF_LOCALIN,
+    err = route6_add(nsid, &ifa->addr.in6, 128, RTF_LOCALIN,
                     &in6addr_any, ifa->idev->dev,
                     &in6addr_any, ifa->idev->dev->mtu);
     if (err != EDPVS_OK && err != EDPVS_EXIST)
@@ -768,7 +790,7 @@ static int ifa_add_route6(struct inet_ifaddr *ifa)
         return EDPVS_OK;
 
     ipv6_addr_prefix(&net, &ifa->addr.in6, ifa->plen);
-    err = route6_add(&net, ifa->plen, RTF_FORWARD,
+    err = route6_add(nsid, &net, ifa->plen, RTF_FORWARD,
                      &in6addr_any, ifa->idev->dev,
                      &ifa->addr.in6, ifa->idev->dev->mtu);
     if (err != EDPVS_OK && err != EDPVS_EXIST)
@@ -777,7 +799,7 @@ static int ifa_add_route6(struct inet_ifaddr *ifa)
     return EDPVS_OK;
 
 errout:
-    route6_del(&ifa->addr.in6, 128, RTF_LOCALIN,
+    route6_del(nsid, &ifa->addr.in6, 128, RTF_LOCALIN,
                &in6addr_any, ifa->idev->dev,
                &in6addr_any, ifa->idev->dev->mtu);
     return err;
@@ -803,8 +825,8 @@ static int ifa_del_route4(struct inet_ifaddr *ifa)
 {
     int err;
     union inet_addr net;
-
-    err = route_del(&ifa->addr.in, 32, RTF_LOCALIN,
+    nsid_t nsid = ifa->idev->dev->nsid;
+    err = route_del(nsid, &ifa->addr.in, 32, RTF_LOCALIN,
                     NULL, ifa->idev->dev, NULL, 0, 0);
     if (err != EDPVS_OK && err != EDPVS_NOTEXIST)
         RTE_LOG(WARNING, IFA, "%s: fail to delete localin route\n", __func__);
@@ -816,7 +838,7 @@ static int ifa_del_route4(struct inet_ifaddr *ifa)
     if (err != EDPVS_OK)
         RTE_LOG(WARNING, IFA, "%s: fail to get ip net\n", __func__);
 
-    err = route_del(&net.in, ifa->plen, RTF_FORWARD,
+    err = route_del(nsid, &net.in, ifa->plen, RTF_FORWARD,
                     NULL, ifa->idev->dev, &ifa->addr.in, 0, 0);
     if (err != EDPVS_OK && err != EDPVS_NOTEXIST)
         RTE_LOG(WARNING, IFA, "%s: fail to delete forward route\n", __func__);
@@ -828,8 +850,9 @@ static int ifa_del_route6(struct inet_ifaddr *ifa)
 {
     int err;
     struct in6_addr net;
+    nsid_t nsid = ifa->idev->dev->nsid;
 
-    err = route6_del(&ifa->addr.in6, 128, RTF_LOCALIN,
+    err = route6_del(nsid, &ifa->addr.in6, 128, RTF_LOCALIN,
                      &in6addr_any, ifa->idev->dev,
                      &in6addr_any, ifa->idev->dev->mtu);
     if (err != EDPVS_OK && err != EDPVS_NOTEXIST)
@@ -840,7 +863,7 @@ static int ifa_del_route6(struct inet_ifaddr *ifa)
 
     ipv6_addr_prefix(&net, &ifa->addr.in6, ifa->plen);
 
-    err = route6_del(&net, ifa->plen, RTF_FORWARD,
+    err = route6_del(nsid, &net, ifa->plen, RTF_FORWARD,
                      &in6addr_any, ifa->idev->dev,
                      &in6addr_any, ifa->idev->dev->mtu);
     if (err != EDPVS_OK && err != EDPVS_NOTEXIST)
@@ -970,13 +993,15 @@ static int ifa_entry_add(const struct ifaddr_action *param)
     struct inet_ifaddr *ifa;
     struct timeval timeo = { 0 };
     bool is_master = (rte_lcore_id() == g_master_lcore_id);
+    nsid_t nsid;
 
     if (!param || !param->dev || !ifa_prefix_check(param->af,
                 &param->addr, param->plen))
         return EDPVS_INVAL;
 
+    nsid = param->nsid;
     idev = dev_get_idev(param->dev);
-    if (!idev)
+    if (!idev || idev->dev->nsid != param->nsid)
         return EDPVS_RESOURCE;
 
     ifa = ifa_lookup(idev, &param->addr, param->plen, param->af);
@@ -987,13 +1012,13 @@ static int ifa_entry_add(const struct ifaddr_action *param)
     }
 
     /* reuse expired ifa */
-    ifa = expired_ifa_lookup(idev, &param->addr, param->plen, param->af);
+    ifa = expired_ifa_lookup(nsid, idev, &param->addr, param->plen, param->af);
     if (ifa) {
         if (ifa->flags & IFA_F_SAPOOL) {
             hold_ifa_sa_pool(ifa); /* hold sa_pool again */
         }
         list_del_init(&ifa->h_list);
-        ifa_hash(idev, ifa);
+        ifa_hash(nsid, idev, ifa);
         ifa_put(ifa);
 
         RTE_LOG(DEBUG, IFA, "[%02d] %s: reuse expired ifaddr %s\n", rte_lcore_id(), __func__,
@@ -1057,7 +1082,7 @@ static int ifa_entry_add(const struct ifaddr_action *param)
         inet_ifaddr_dad_start(ifa);
     }
 
-    ifa_hash(idev, ifa);
+    ifa_hash(nsid, idev, ifa);
 
     RTE_LOG(DEBUG, IFA, "[%02d] %s: add ifaddr %s\n", rte_lcore_id(), __func__,
             inet_ntop(ifa->af, &ifa->addr, ipstr, sizeof(ipstr)));
@@ -1093,7 +1118,7 @@ static int ifa_entry_mod(const struct ifaddr_action *param)
         return EDPVS_INVAL;
 
     idev = dev_get_idev(param->dev);
-    if (!idev)
+    if (!idev || idev->dev->nsid != param->nsid)
         return EDPVS_RESOURCE;
 
     ifa = ifa_lookup(idev, &param->addr, param->plen, param->af);
@@ -1146,7 +1171,7 @@ static int ifa_entry_del(const struct ifaddr_action *param)
         return EDPVS_INVAL;
 
     idev = dev_get_idev(param->dev);
-    if (unlikely(!idev))
+    if (unlikely(!idev) || idev->dev->nsid != param->nsid)
         return EDPVS_RESOURCE;
 
     ifa = ifa_lookup(idev, &param->addr, param->plen, param->af);
@@ -1155,7 +1180,7 @@ static int ifa_entry_del(const struct ifaddr_action *param)
         return EDPVS_NOTEXIST;
     }
 
-    ifa_unhash(ifa);
+    ifa_unhash(param->nsid, ifa);
     ifa_put(ifa);
 
     idev_put(idev);
@@ -1172,12 +1197,12 @@ static int ifa_entry_flush(const struct ifaddr_action *param)
         return EDPVS_INVAL;
 
     idev = dev_get_idev(param->dev);
-    if (unlikely(!idev))
+    if (unlikely(!idev) || idev->dev->nsid != param->nsid)
         return EDPVS_RESOURCE;
 
     list_for_each_entry_safe(ifa, nxt, &idev->ifa_list[cid], d_list) {
         rte_atomic32_inc(&ifa->refcnt); /* hold @ifa before unhash */
-        ifa_unhash(ifa);
+        ifa_unhash(param->nsid, ifa);
         ifa_put(ifa);
     }
 
@@ -1195,7 +1220,7 @@ static int ifa_entry_sync(const struct ifaddr_action *param)
         return EDPVS_INVAL;
 
     idev = dev_get_idev(param->dev);
-    if (!idev)
+    if (!idev || idev->dev->nsid != param->nsid)
         return EDPVS_RESOURCE;
 
     ifa = ifa_lookup(idev, &param->addr, param->plen, param->af);
@@ -1274,6 +1299,7 @@ static void fill_ifaddr_action(int af, struct netif_port *dev,
     param->dev          = dev;
 
     param->op           = op;
+    param->nsid         = dev->nsid;
 }
 
 static void fill_ifaddr_entry(lcoreid_t cid, const struct inet_ifaddr *ifa, struct inet_addr_data *entry)
@@ -1330,7 +1356,7 @@ static void fill_ifaddr_basic(lcoreid_t cid, const struct inet_ifaddr *ifa, stru
     }
 }
 
-static int agent_copy_lcore_entries(const struct inet_device *idev, struct inet_addr_entry *entries, int cnt) {
+static int agent_copy_lcore_entries(nsid_t nsid, const struct inet_device *idev, struct inet_addr_entry *entries, int cnt) {
     int hash, off = 0;
     struct inet_ifaddr *ifa;
     struct inet_addr_entry *entry;
@@ -1345,7 +1371,7 @@ static int agent_copy_lcore_entries(const struct inet_device *idev, struct inet_
         }
     } else {
         for (hash = 0; hash < INET_ADDR_HSIZE; hash++) {
-            list_for_each_entry(ifa, &inet_addr_tab[cid][hash], h_list) {
+            list_for_each_entry(ifa, &inet_addr_tab[cid][nsid][hash], h_list) {
                 entry = entries + off;
                 fill_ifaddr_basic(cid, ifa, entry);
                 if (++off == cnt)
@@ -1357,7 +1383,7 @@ static int agent_copy_lcore_entries(const struct inet_device *idev, struct inet_
 }
 #endif /* CONFIG_DPVS_AGENT */
 
-static int copy_lcore_entries(const struct inet_device *idev,
+static int copy_lcore_entries(nsid_t nsid, const struct inet_device *idev,
                               int max_entries, struct inet_addr_data_array *array)
 {
     int off, hash;
@@ -1382,7 +1408,10 @@ static int copy_lcore_entries(const struct inet_device *idev,
         }
     } else {
         for (hash = 0; hash < INET_ADDR_HSIZE; hash++) {
-            list_for_each_entry(ifa, &inet_addr_tab[cid][hash], h_list) {
+            list_for_each_entry(ifa, &inet_addr_tab[cid][nsid][hash], h_list) {
+                if (nsid != NAMESPACE_ID_ALL && nsid != ifa->idev->dev->nsid) {
+                    continue;
+                }
                 fill_ifaddr_entry(cid, ifa, &array->addrs[off++]);
                 if (off >= max_entries)
                     break;
@@ -1397,20 +1426,22 @@ static int copy_lcore_entries(const struct inet_device *idev,
 static int ifa_msg_get_cb(struct dpvs_msg *msg)
 {
     int ifa_cnt, len;
-    void *ptr;
     struct inet_device *idev;
     struct inet_addr_data_array *array;
     lcoreid_t cid = rte_lcore_id();
+    nsid_t nsid;
+    struct ifaddr_action_get *param;
 
-    if (!msg || (msg->len && msg->len != sizeof(idev)))
+    if (!msg || (msg->len != sizeof(struct ifaddr_action_get)))
         return EDPVS_INVAL;
-    ptr = msg->len ? (void *)msg->data : NULL;
-    idev = ptr ? (*(struct inet_device **)ptr) : NULL;
+    param = (struct ifaddr_action_get *)msg->data;
+    idev = param->idev;
+    nsid = param->nsid;
 
     if (idev)
         ifa_cnt = idev->ifa_cnt[cid];
     else
-        ifa_cnt = inet_addr_cnt[cid];
+        ifa_cnt = get_ns_inet_addr_cnt(nsid, cid);
     len = sizeof(struct inet_addr_data_array) + ifa_cnt * sizeof(struct inet_addr_data);
     array = msg_reply_alloc(len);
     if (unlikely(!array))
@@ -1419,7 +1450,7 @@ static int ifa_msg_get_cb(struct dpvs_msg *msg)
     /* zero naddr before copy, do not memset the whole memory for performance */
     array->naddr = 0;
 
-    if (copy_lcore_entries(idev, ifa_cnt, array) != EDPVS_OK)
+    if (copy_lcore_entries(nsid, idev, ifa_cnt, array) != EDPVS_OK)
         RTE_LOG(WARNING, IFA, "[%02d] %s: fail to copy ifa entries\n.", cid, __func__);
 
     msg->reply.len = len;
@@ -1728,7 +1759,7 @@ static int inet_addr_sync(const struct ifaddr_action *param)
 }
 
 #ifdef CONFIG_DPVS_AGENT
-static int ifaddr_agent_get_basic(struct inet_device *idev, struct inet_addr_front** parray, int *plen)
+static int ifaddr_agent_get_basic(nsid_t nsid, struct inet_device *idev, struct inet_addr_front** parray, int *plen)
 {
     lcoreid_t cid;
     int ifa_cnt, len, err;
@@ -1741,7 +1772,7 @@ static int ifaddr_agent_get_basic(struct inet_device *idev, struct inet_addr_fro
     if (idev)
         ifa_cnt = idev->ifa_cnt[cid];
     else
-        ifa_cnt = inet_addr_cnt[cid];
+        ifa_cnt = inet_addr_cnt[cid][nsid];
 
     len = sizeof(struct inet_addr_front) + ifa_cnt * sizeof(struct inet_addr_entry);
     array = rte_calloc(NULL, 1, len, RTE_CACHE_LINE_SIZE);
@@ -1750,7 +1781,7 @@ static int ifaddr_agent_get_basic(struct inet_device *idev, struct inet_addr_fro
 
     array->count = ifa_cnt;
 
-    err = agent_copy_lcore_entries(idev, (struct inet_addr_entry*)array->data, array->count);
+    err = agent_copy_lcore_entries(nsid, idev, (struct inet_addr_entry*)array->data, array->count);
     if (err != EDPVS_OK) {
         rte_free(array);
         return err;
@@ -1762,7 +1793,7 @@ static int ifaddr_agent_get_basic(struct inet_device *idev, struct inet_addr_fro
 }
 #endif /* CONFIG_DPVS_AGENT */
 
-static int ifaddr_get_basic(struct inet_device *idev, struct inet_addr_data_array **parray, int *plen)
+static int ifaddr_get_basic(nsid_t nsid, struct inet_device *idev, struct inet_addr_data_array **parray, int *plen)
 {
     lcoreid_t cid;
     int ifa_cnt, len, err;
@@ -1775,14 +1806,14 @@ static int ifaddr_get_basic(struct inet_device *idev, struct inet_addr_data_arra
     if (idev)
         ifa_cnt = idev->ifa_cnt[cid];
     else
-        ifa_cnt = inet_addr_cnt[cid];
+        ifa_cnt = get_ns_inet_addr_cnt(nsid, cid);
 
     len = sizeof(struct inet_addr_data_array) + ifa_cnt * sizeof(struct inet_addr_data);
     array = rte_calloc(NULL, 1, len, RTE_CACHE_LINE_SIZE);
     if (unlikely(!array))
         return EDPVS_NOMEM;
 
-    err = copy_lcore_entries(idev, ifa_cnt, array);
+    err = copy_lcore_entries(nsid, idev, ifa_cnt, array);
     if (err != EDPVS_OK) {
         rte_free(array);
         return err;
@@ -1794,19 +1825,19 @@ static int ifaddr_get_basic(struct inet_device *idev, struct inet_addr_data_arra
 }
 
 #ifdef CONFIG_DPVS_AGENT
-static int ifaddr_agent_get_stats(struct inet_device *idev, struct inet_addr_front **parray, int *plen)
+static int ifaddr_agent_get_stats(nsid_t nsid, struct inet_device *idev, struct inet_addr_front **parray, int *plen)
 {
     int err, i;
     struct inet_addr_stats_detail *detail;
     struct dpvs_msg *cur, *msg = NULL;
     struct inet_addr_data_array *arrmsg;
     struct dpvs_multicast_queue *reply = NULL;
+    struct ifaddr_action_get param;
+    param.idev = idev;
+    param.nsid = nsid;
 
     /* collect ifa sapool stats from slaves */
-    if (idev)
-        msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(idev), &idev);
-    else
-        msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), 0, NULL);
+    msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(struct ifaddr_action_get), &param);
     if (!msg) {
         err = EDPVS_NOMEM;
         goto errout;
@@ -1862,23 +1893,23 @@ errout:
 }
 #endif /* CONFIG_DPVS_AGENT */
 
-static int ifaddr_get_stats(struct inet_device *idev, struct inet_addr_data_array **parray, int *plen)
+static int ifaddr_get_stats(nsid_t nsid, struct inet_device *idev, struct inet_addr_data_array **parray, int *plen)
 {
     int ii, err;
     struct inet_addr_data_array *arrmsg, *array;
     struct dpvs_msg *cur, *msg = NULL;
     struct dpvs_multicast_queue *reply = NULL;
+    struct ifaddr_action_get param;
+    param.nsid = nsid;
+    param.idev = idev;
 
-    err = ifaddr_get_basic(idev, parray, plen);
+    err = ifaddr_get_basic(nsid, idev, parray, plen);
     if (err != EDPVS_OK)
         return err;
     array = *parray;
 
     /* collect ifa sapool stats from slaves */
-    if (idev)
-        msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(idev), &idev);
-    else
-        msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), 0, NULL);
+    msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(param), &param);
     if (!msg) {
         err = EDPVS_NOMEM;
         goto errout;
@@ -1916,19 +1947,22 @@ errout:
     return err;
 }
 
-static int ifaddr_get_verbose(struct inet_device *idev, struct inet_addr_data_array **parray, int *plen)
+static int ifaddr_get_verbose(nsid_t nsid, struct inet_device *idev, struct inet_addr_data_array **parray, int *plen)
 {
     lcoreid_t cid;
     int ifa_cnt, len, off, ii, err;
     struct inet_addr_data_array *array, *arrmsg;
     struct dpvs_msg *cur, *msg = NULL;
     struct dpvs_multicast_queue *reply = NULL;
+    struct ifaddr_action_get param;
+    param.nsid = nsid;
+    param.idev = idev;
 
     cid = rte_lcore_id();
     if (idev)
         ifa_cnt = (slave_workers + 1) * idev->ifa_cnt[cid];
     else
-        ifa_cnt = (slave_workers + 1) * inet_addr_cnt[cid];
+        ifa_cnt = (slave_workers + 1) * get_ns_inet_addr_cnt(nsid, cid);
 
     len = sizeof(struct inet_addr_data_array) + ifa_cnt * sizeof(struct inet_addr_data);
     array = rte_calloc(NULL, 1, len, RTE_CACHE_LINE_SIZE);
@@ -1936,15 +1970,12 @@ static int ifaddr_get_verbose(struct inet_device *idev, struct inet_addr_data_ar
         return EDPVS_NOMEM;
 
     /* master ifa entries */
-    err = copy_lcore_entries(idev, ifa_cnt, array);
+    err = copy_lcore_entries(nsid, idev, ifa_cnt, array);
     if (err != EDPVS_OK)
         goto errout;
     off = array->naddr;
 
-    if (idev)
-        msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(idev), &idev);
-    else
-        msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), 0, NULL);
+    msg = msg_make(MSG_TYPE_IFA_GET, 0, DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(param), &param);
     if (!msg) {
         err = EDPVS_NOMEM;
         goto errout;
@@ -2056,7 +2087,7 @@ static int ifa_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
     }
 
     dev = netif_port_get_by_name(entry->ifname);
-    if (!dev) {
+    if (!dev || (param->nsid != NAMESPACE_ID_ALL && dev->nsid != param->nsid)) {
         RTE_LOG(WARNING, IFA, "%s: device %s not found\n", __func__,
                 entry->ifname);
         return EDPVS_NOTEXIST;
@@ -2112,6 +2143,7 @@ static int ifa_sockopt_agent_get(sockoptid_t opt, const void *conf, size_t size,
     const struct inet_addr_entry *entry = conf;
     int len = 0;
     int err;
+    nsid_t nsid = entry->nsid;
 
     if (entry->af != AF_INET && entry->af != AF_INET6 && entry->af != AF_UNSPEC) {
         return EDPVS_NOTSUPP;
@@ -2131,13 +2163,13 @@ static int ifa_sockopt_agent_get(sockoptid_t opt, const void *conf, size_t size,
 
     switch (opt) {
         case DPVSAGENT_IFADDR_GET_STATS:
-            err = ifaddr_agent_get_stats(idev, &array, &len);
+            err = ifaddr_agent_get_stats(nsid, idev, &array, &len);
             break;
         case DPVSAGENT_IFADDR_GET_VERBOSE:
             // err = ifaddr_agent_get_verbose(idev, &array, &len);
             return EDPVS_NOTSUPP;
         default:
-            err = ifaddr_agent_get_basic(idev, &array, &len);
+            err = ifaddr_agent_get_basic(nsid, idev, &array, &len);
     }
     if (err != EDPVS_OK) {
         RTE_LOG(WARNING, IFA, "%s: fail to get inet addresses -- %s!\n",
@@ -2160,6 +2192,7 @@ static int ifa_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
     int err, len = 0;
     struct netif_port *dev;
     struct inet_device *idev = NULL;
+    nsid_t nsid = NAMESPACE_ID_INVALID;
 
     struct inet_addr_data_array *array = NULL;
     const struct inet_addr_param *param = conf;
@@ -2179,25 +2212,26 @@ static int ifa_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
             param->ifa_entry.af != AF_INET6 &&
             param->ifa_entry.af != AF_UNSPEC)
             return EDPVS_NOTSUPP;
+        nsid = param->nsid;
 
         if (strlen(param->ifa_entry.ifname)) {
             dev = netif_port_get_by_name(param->ifa_entry.ifname);
-            if (!dev) {
+            if (!dev || (nsid != NAMESPACE_ID_ALL && dev->nsid != nsid)) {
                 RTE_LOG(WARNING, IFA, "%s: no such device: %s\n",
                         __func__, param->ifa_entry.ifname);
                 return EDPVS_NOTEXIST;
             }
             idev = dev_get_idev(dev);
-            if (!idev)
+            if (!idev || idev->dev->nsid != param->nsid)
                 return EDPVS_RESOURCE;
         }
 
         if (param->ifa_ops_flags & IFA_F_OPS_VERBOSE)
-            err = ifaddr_get_verbose(idev, &array, &len);
+            err = ifaddr_get_verbose(nsid, idev, &array, &len);
         else if (param->ifa_ops_flags & IFA_F_OPS_STATS)
-            err = ifaddr_get_stats(idev, &array, &len);
+            err = ifaddr_get_stats(nsid, idev, &array, &len);
         else
-            err = ifaddr_get_basic(idev, &array, &len);
+            err = ifaddr_get_basic(nsid, idev, &array, &len);
 
         if (err != EDPVS_OK) {
             RTE_LOG(WARNING, IFA, "%s: fail to get inet addresses -- %s!\n",
@@ -2306,15 +2340,18 @@ static struct dpvs_sockopts ifa_sockopts = {
 int inet_addr_init(void)
 {
     lcoreid_t cid;
+    nsid_t nsid;
     int err, ii;
 
     netif_get_slave_lcores(&slave_workers, &slave_worker_mask);
 
     for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
-        for (ii = 0; ii < INET_ADDR_HSIZE; ii++) {
-            INIT_LIST_HEAD(&inet_addr_tab[cid][ii]);
+        for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
+            for (ii = 0; ii < INET_ADDR_HSIZE; ii++) {
+                INIT_LIST_HEAD(&inet_addr_tab[cid][nsid][ii]);
+            }
+            INIT_LIST_HEAD(&ifa_expired_list[cid][nsid]);
         }
-        INIT_LIST_HEAD(&ifa_expired_list[cid]);
     }
 
     ifa_msg_types[2].cid = rte_get_main_lcore();

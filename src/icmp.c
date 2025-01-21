@@ -16,6 +16,7 @@
  *
  */
 #include <assert.h>
+#include "conf/common.h"
 #include "ipv4.h"
 #include "icmp.h"
 #include "netinet/in.h"
@@ -30,7 +31,7 @@
 #define RTE_LOGTYPE_ICMP    RTE_LOGTYPE_USER1
 
 struct icmp_ctrl {
-    int (*handler)(struct rte_mbuf *mbuf);
+    int (*handler)(nsid_t nsid, struct rte_mbuf *mbuf);
     bool is_error;          /* ICMP error message */
 };
 
@@ -50,7 +51,7 @@ static void icmp_dump_hdr(const struct rte_mbuf *mbuf)
 }
 #endif
 
-static int icmp_echo(struct rte_mbuf *mbuf)
+static int icmp_echo(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct rte_ipv4_hdr *iph = MBUF_USERDATA(mbuf, struct rte_ipv4_hdr *, MBUF_FIELD_PROTO);
     struct rte_icmp_hdr *ich = rte_pktmbuf_mtod(mbuf, struct rte_icmp_hdr *);
@@ -92,7 +93,7 @@ static int icmp_echo(struct rte_mbuf *mbuf)
     fl4.fl4_proto = IPPROTO_ICMP;
     fl4.fl4_tos = iph->type_of_service;
 
-    return ipv4_xmit(mbuf, &fl4);
+    return ipv4_xmit(nsid, mbuf, &fl4);
 
 errout:
     rte_pktmbuf_free(mbuf);
@@ -162,7 +163,7 @@ static struct icmp_ctrl icmp_ctrls[MAX_ICMP_CTRL] = {
 };
 
 /* @imbuf is input (original) IP packet to trigger ICMP. */
-void icmp_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
+void icmp_send(nsid_t nsid, struct rte_mbuf *imbuf, int type, int code, uint32_t info)
 {
     struct route_entry *rt = MBUF_USERDATA(imbuf, struct route_entry *, MBUF_FIELD_ROUTE);
     struct rte_ipv4_hdr *iph = ip4_hdr(imbuf);
@@ -278,13 +279,13 @@ void icmp_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
     csum = rte_raw_cksum(icmph, mbuf->pkt_len);
     icmph->checksum = (csum == 0xffff) ? csum : ~csum;
 
-    if ((err = ipv4_xmit(mbuf, &fl4)) != EDPVS_OK)
+    if ((err = ipv4_xmit(nsid, mbuf, &fl4)) != EDPVS_OK)
         RTE_LOG(DEBUG, ICMP, "%s: ipv4_xmit: %s.\n",
                 __func__, dpvs_strerror(err));
     return;
 }
 
-static int icmp_rcv(struct rte_mbuf *mbuf)
+static int icmp_rcv(nsid_t nsid, struct rte_mbuf *mbuf)
 {
     struct rte_ipv4_hdr *iph = MBUF_USERDATA(mbuf, struct rte_ipv4_hdr *, MBUF_FIELD_PROTO);
     struct rte_icmp_hdr *ich;
@@ -305,7 +306,7 @@ static int icmp_rcv(struct rte_mbuf *mbuf)
 
     ctrl = &icmp_ctrls[ich->icmp_type];
     if (ctrl->handler)
-        return ctrl->handler(mbuf);
+        return ctrl->handler(nsid, mbuf);
     else
         return EDPVS_KNICONTINUE; /* KNI may like it, don't drop */
 
@@ -387,6 +388,7 @@ void icmp_redirect_proc(void *args)
     for (i = 0; i < nb_rb; i++) {
         struct rte_mbuf *mbuf = mbufs[i];
         struct netif_port *dev = netif_port_get(mbuf->port);
+        nsid_t nsid = dev->nsid;
 
         /* Remove ether_hdr at the beginning of an mbuf */
         data_off = mbuf->data_off;
@@ -395,7 +397,7 @@ void icmp_redirect_proc(void *args)
             return;
         }
 
-        ret = INET_HOOK(AF_INET, INET_HOOK_PRE_ROUTING,
+        ret = INET_HOOK(nsid, AF_INET, INET_HOOK_PRE_ROUTING,
                      mbuf, dev, NULL, ipv4_rcv_fin);
         if (ret == EDPVS_KNICONTINUE) {
             if (dev->flag & NETIF_PORT_FLAG_FORWARD2KNI) {

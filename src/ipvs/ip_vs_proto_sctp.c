@@ -3,6 +3,7 @@
 #include "dpdk.h"
 #include "mbuf.h"
 #include "ipv6.h"
+#include "namespace.h"
 #include "route6.h"
 #include "neigh.h"
 #include "ipvs/ipvs.h"
@@ -50,7 +51,7 @@ static inline uint32_t sctp_calculate_cksum(struct rte_mbuf *mbuf,
 static int sctp_csum_check(struct dp_vs_proto *proto, int af,
                struct rte_mbuf *mbuf);
 
-static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
+static struct dp_vs_conn *sctp_conn_lookup(nsid_t nsid, struct dp_vs_proto *proto,
                        const struct dp_vs_iphdr *iph,
                        struct rte_mbuf *mbuf, int *direct,
                        bool reverse, bool *drop,
@@ -82,7 +83,7 @@ static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
         return NULL;
     }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto, &iph->saddr, &iph->daddr,
+    conn = dp_vs_conn_get(nsid, iph->af, iph->proto, &iph->saddr, &iph->daddr,
                   sh->src_port, sh->dest_port, direct, reverse);
 
     /*
@@ -106,7 +107,7 @@ static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
     } else {
         struct dp_vs_redirect *r;
 
-        r = dp_vs_redirect_get(iph->af, iph->proto, &iph->saddr,
+        r = dp_vs_redirect_get(nsid, iph->af, iph->proto, &iph->saddr,
                        &iph->daddr, sh->src_port,
                        sh->dest_port);
         if (r) {
@@ -117,7 +118,7 @@ static struct dp_vs_conn *sctp_conn_lookup(struct dp_vs_proto *proto,
     return conn;
 }
 
-static int sctp_conn_schedule(struct dp_vs_proto *proto,
+static int sctp_conn_schedule(nsid_t nsid, struct dp_vs_proto *proto,
                   const struct dp_vs_iphdr *iph,
                   struct rte_mbuf *mbuf, struct dp_vs_conn **conn,
                   int *verdict)
@@ -133,14 +134,14 @@ static int sctp_conn_schedule(struct dp_vs_proto *proto,
         return EDPVS_INVPKT;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr,
+    svc = dp_vs_service_lookup(nsid, iph->af, iph->proto, &iph->daddr,
                    sh->dest_port, 0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
         return EDPVS_NOSERV;
     }
 
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(nsid, svc, iph, mbuf, false);
     if (!*conn) {
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
