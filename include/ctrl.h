@@ -23,6 +23,7 @@
 #include "conf/sockopts.h"
 #include "list.h"
 #include "dpdk.h"
+#include "rte_ether.h"
 
 #define RTE_LOGTYPE_MSGMGR RTE_LOGTYPE_USER2
 
@@ -216,6 +217,9 @@ int msg_dump(const struct dpvs_msg *msg, char *buf, int len);
 #define MSG_TYPE_DEST_CHECK_NOTIFY_SLAVES   42
 #define MSG_TYPE_IFA_IDEVINIT               43
 #define MSG_TYPE_ROUTE_FLUSH                44
+#define MSG_TYPE_NAMESPACE_FLUSH            45
+#define MSG_TYPE_VIRTIO_USER_ADD            46
+#define MSG_TYPE_NETIF_ADD                  47
 #define MSG_TYPE_IPVS_RANGE_START           100
 
 /* for svc per_core, refer to service.h*/
@@ -269,6 +273,7 @@ enum sockopt_type {
 struct dpvs_sock_msg {
     uint32_t version;
     sockoptid_t id;
+    int fd;
     enum sockopt_type type;
     size_t len;
     char data[0];
@@ -303,5 +308,8 @@ void install_control_keywords(void);
 
 int ctrl_init(void);
 int ctrl_term(void);
+
+int reply_msg(struct dpvs_sock_msg *msg, int ret);
+struct dpvs_sock_msg *msg_from_data(const void *data_prt);
 
 #endif

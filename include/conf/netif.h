@@ -253,31 +253,4 @@ typedef struct netif_nic_set {
     uint16_t lldp_off:1;
 } netif_nic_set_t;
 
-typedef struct netif_bond_set {
-    char name[32];
-    union {
-        int mode;
-        char slave[32];
-        char primary[32];
-        char xmit_policy[32];
-        int link_monitor_interval;
-        int link_down_prop;
-        int link_up_prop;
-    } param;
-    enum {
-        ACT_ADD = 1,
-        ACT_DEL,
-        ACT_SET,
-    } act;
-    enum {
-        OPT_MODE = 1,
-        OPT_SLAVE,
-        OPT_PRIMARY,
-        OPT_XMIT_POLICY,
-        OPT_LINK_MONITOR_INTERVAL,
-        OPT_LINK_DOWN_PROP,
-        OPT_LINK_UP_PROP,
-    } opt;
-} netif_bond_set_t;
-
 #endif

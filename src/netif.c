@@ -28,22 +28,25 @@
 #include "dpdk.h"
 #include "conf/common.h"
 #include "generic/rte_cycles.h"
+#include "generic/rte_rwlock.h"
+#include "global_data.h"
 #include "namespace.h"
 #include "netif.h"
 #include "netif_addr.h"
 #include "conf/netif_addr.h"
 #include "rte_ethdev.h"
-#include "vlan.h"
 #include "ctrl.h"
 #include "list.h"
 #include "kni.h"
 #include <rte_version.h>
 #include "conf/netif.h"
+#include "rte_lcore.h"
+#include "rte_malloc.h"
+#include "tc/tc.h"
 #include "timer.h"
 #include "parser/parser.h"
 #include "neigh.h"
 #include "scheduler.h"
-#include "netif_flow.h"
 #include "linux_if.h"
 
 #include <rte_arp.h>
@@ -52,6 +55,7 @@
 #include <ipvs/redirect.h>
 #include <rte_avp_common.h>
 #include <rte_bus.h>
+#include <unistd.h>
 
 #ifdef CONFIG_ICMP_REDIRECT_CORE
 #include "icmp.h"
@@ -86,15 +90,13 @@ int netif_pktpool_mbuf_cache = NETIF_PKTPOOL_MBUF_CACHE_DEF;
 static portid_t phy_pid_base = 0;
 static portid_t phy_pid_end = -1; // not inclusive
 /* bond device id = bond_pid_base + index */
-static portid_t bond_pid_base = -1;
-static portid_t bond_pid_end = -1; // not inclusive
 
 static portid_t port_id_end = 0;
 
 static uint16_t g_nports;
 
 /*for arp process*/
-static struct rte_ring *arp_ring[DPVS_MAX_LCORE];
+static struct rte_ring *arp_ring[DPVS_MAX_NETNS][DPVS_MAX_LCORE] = {0};
 
 #define NETIF_BOND_MODE_DEF         BONDING_MODE_ROUND_ROBIN
 #define NETIF_BOND_NUMA_NODE_DEF    0
@@ -152,8 +154,7 @@ struct worker_conf_stream {
     struct list_head worker_list_node;
 };
 
-static struct list_head port_list;      /* device configurations from cfgfile */
-static struct list_head bond_list;      /* bonding configurations from cfgfile */
+// static struct list_head port_list;      /* device configurations from cfgfile */
 static struct list_head worker_list;    /* lcore configurations from cfgfile */
 
 #define NETIF_PORT_TABLE_BITS 8
@@ -161,9 +162,8 @@ static struct list_head worker_list;    /* lcore configurations from cfgfile */
 #define NETIF_PORT_TABLE_MASK (NETIF_PORT_TABLE_BUCKETS - 1)
 static struct list_head port_tab[NETIF_PORT_TABLE_BUCKETS]; /* hashed by id */
 static struct list_head port_ntab[NETIF_PORT_TABLE_BUCKETS]; /* hashed by name */
-/* Note: Lockless, NIC can only be registered on initialization stage and
- *       unregistered on cleanup stage
- */
+static rte_rwlock_t port_rwlock[NETIF_PORT_TABLE_BUCKETS];
+static rte_rwlock_t port_nrwlock[NETIF_PORT_TABLE_BUCKETS];
 
 #define NETIF_CTRL_BUFFER_LEN     4096
 
@@ -175,10 +175,6 @@ bool is_physical_port(portid_t pid)
     return pid >= phy_pid_base && pid < phy_pid_end;
 }
 
-bool is_bond_port(portid_t pid)
-{
-    return pid >= bond_pid_base && pid < bond_pid_end;
-}
 
 void netif_physical_port_range(portid_t *start, portid_t *end)
 {
@@ -186,14 +182,6 @@ void netif_physical_port_range(portid_t *start, portid_t *end)
         *start = phy_pid_base;
     if (end)
         *end = phy_pid_end;
-}
-
-void netif_bond_port_range(portid_t *start, portid_t *end)
-{
-    if (start)
-        *start = bond_pid_base;
-    if (end)
-        *end = bond_pid_end;
 }
 
 bool is_lcore_id_valid(lcoreid_t cid)
@@ -216,32 +204,8 @@ static bool is_lcore_id_fwd(lcoreid_t cid)
             (g_slave_lcore_mask & (1L << cid)));
 }
 
-static inline struct port_conf_stream *get_port_conf_stream(const char *name)
-{
-    struct port_conf_stream *current_cfg;
-
-    list_for_each_entry(current_cfg, &port_list, port_list_node) {
-        if (!strcmp(name, current_cfg->name))
-            return current_cfg;
-    }
-
-    return NULL;
-}
-
 static void netif_defs_handler(vector_t tokens)
 {
-    struct port_conf_stream *port_cfg, *port_cfg_next;
-    struct bond_conf_stream *bond_cfg, *bond_cfg_next;
-
-    list_for_each_entry_safe(port_cfg, port_cfg_next, &port_list, port_list_node) {
-        list_del(&port_cfg->port_list_node);
-        rte_free(port_cfg);
-    }
-
-    list_for_each_entry_safe(bond_cfg, bond_cfg_next, &bond_list, bond_list_node) {
-        list_del(&bond_cfg->bond_list_node);
-        rte_free(bond_cfg);
-    }
 }
 
 static void pktpool_size_handler(vector_t tokens)
@@ -281,427 +245,6 @@ static void pktpool_cache_handler(vector_t tokens)
         is_power2(cache_size, 0, &cache_size);
         RTE_LOG(INFO, NETIF, "pktpool_cache_size = %d (round to 2^n)\n", cache_size);
         netif_pktpool_mbuf_cache = cache_size;
-    }
-
-    FREE_PTR(str);
-}
-
-#ifdef CONFIG_DPVS_FDIR
-static enum rte_fdir_mode g_fdir_mode = RTE_FDIR_MODE_PERFECT;
-
-static void fdir_mode_handler(vector_t tokens)
-{
-    char *mode, *str = set_value(tokens);
-
-    assert(str);
-    mode = strlwr(str);
-
-    if (!strncmp(mode, "perfect", sizeof("perfect")))
-        g_fdir_mode = RTE_FDIR_MODE_PERFECT;
-    else if (!strncmp(mode, "signature", sizeof("signature")))
-        g_fdir_mode = RTE_FDIR_MODE_SIGNATURE;
-    else {
-        RTE_LOG(WARNING, NETIF, "invalid fdir_mode %s, using default %s\n",
-                mode, "perfect");
-        g_fdir_mode = RTE_FDIR_MODE_PERFECT;
-    }
-    RTE_LOG(INFO, NETIF, "g_fdir_mode = %s\n", mode);
-
-    FREE_PTR(str);
-}
-#endif
-
-static void device_handler(vector_t tokens)
-{
-    assert(VECTOR_SIZE(tokens) >= 1);
-
-    char *str;
-    struct port_conf_stream *port_cfg =
-        rte_zmalloc(NULL, sizeof(struct port_conf_stream), RTE_CACHE_LINE_SIZE);
-    if (!port_cfg) {
-        RTE_LOG(ERR, NETIF, "%s: no memory\n", __func__);
-        return;
-    }
-
-    port_cfg->port_id = -1;
-    str = VECTOR_SLOT(tokens, 1);
-    RTE_LOG(INFO, NETIF, "netif device config: %s\n", str);
-    strncpy(port_cfg->name, str, sizeof(port_cfg->name));
-    port_cfg->rx_queue_nb = -1;
-    port_cfg->tx_queue_nb = -1;
-    port_cfg->rx_desc_nb = NETIF_NB_RX_DESC_DEF;
-    port_cfg->tx_desc_nb = NETIF_NB_TX_DESC_DEF;
-    port_cfg->tx_mbuf_fast_free = true;
-    port_cfg->mtu = NETIF_DEFAULT_ETH_MTU;
-
-    port_cfg->promisc_mode = false;
-    port_cfg->allmulticast = false;
-    strncpy(port_cfg->rss, "tcp", sizeof(port_cfg->rss));
-
-    list_add(&port_cfg->port_list_node, &port_list);
-}
-
-static void rx_queue_number_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int rx_queues;
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    rx_queues = atoi(str);
-    if (rx_queues < 0 || rx_queues > NETIF_MAX_QUEUES) {
-        RTE_LOG(WARNING, NETIF, "invalid %s:rx_queue_number %s, using default %d\n",
-                current_device->name, str, NETIF_MAX_QUEUES);
-        current_device->rx_queue_nb = NETIF_MAX_QUEUES;
-    } else {
-        RTE_LOG(WARNING, NETIF, "%s:rx_queue_number = %d\n",
-                current_device->name, rx_queues);
-        current_device->rx_queue_nb = rx_queues;
-    }
-
-    FREE_PTR(str);
-}
-
-static void rx_desc_nb_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int desc_nb;
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    desc_nb = atoi(str);
-    if (desc_nb < NETIF_NB_RX_DESC_MIN || desc_nb > NETIF_NB_RX_DESC_MAX) {
-        RTE_LOG(WARNING, NETIF, "invalid %s:nb_rx_desc %s, using default %d\n",
-                current_device->name, str, NETIF_NB_RX_DESC_DEF);
-        current_device->rx_desc_nb = NETIF_NB_RX_DESC_DEF;
-    } else {
-        is_power2(desc_nb, 0, &desc_nb);
-        RTE_LOG(INFO, NETIF, "%s:nb_rx_desc = %d (round to 2^n)\n",
-                current_device->name, desc_nb);
-        current_device->rx_desc_nb = desc_nb;
-    }
-
-    FREE_PTR(str);
-}
-
-static void rss_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    if (!strcmp(str, "all") || !strcmp(str, "ip") || !strcmp(str, "tcp") || !strcmp(str, "udp")
-            || !strcmp(str, "sctp") || !strcmp(str, "ether") || !strcmp(str, "port") || !strcmp(str, "tunnel")
-            || (strstr(str, "|") && str[0] != '|')) {
-        RTE_LOG(INFO, NETIF, "%s:rss = %s\n", current_device->name, str);
-        strncpy(current_device->rss, str, sizeof(current_device->rss));
-    } else {
-        RTE_LOG(WARNING, NETIF, "invalid %s:rss %s, using default rss_tcp\n",
-                current_device->name, str);
-        strncpy(current_device->rss, "tcp", sizeof(current_device->rss));
-    }
-
-    FREE_PTR(str);
-}
-
-static void tx_queue_number_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int tx_queues;
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    tx_queues = atoi(str);
-    if (tx_queues < 0 || tx_queues > NETIF_MAX_QUEUES) {
-        RTE_LOG(WARNING, NETIF, "invalid %s:tx_queue_number %s, using default %d\n",
-                current_device->name, str, NETIF_MAX_QUEUES);
-        current_device->tx_queue_nb = NETIF_MAX_QUEUES;
-    } else {
-        RTE_LOG(INFO, NETIF, "%s:tx_queue_number = %d\n",
-                current_device->name, tx_queues);
-        current_device->tx_queue_nb = tx_queues;
-    }
-
-    FREE_PTR(str);
-}
-
-static void tx_desc_nb_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int desc_nb;
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    desc_nb = atoi(str);
-    if (desc_nb < NETIF_NB_TX_DESC_MIN || desc_nb > NETIF_NB_TX_DESC_MAX) {
-        RTE_LOG(WARNING, NETIF, "invalid nb_tx_desc %s, using default %d\n",
-                str, NETIF_NB_TX_DESC_DEF);
-        current_device->tx_desc_nb = NETIF_NB_TX_DESC_DEF;
-    } else {
-        is_power2(desc_nb, 0, &desc_nb);
-        RTE_LOG(INFO, NETIF, "%s:nb_tx_desc = %d (round to 2^n)\n",
-                current_device->name, desc_nb);
-        current_device->tx_desc_nb = desc_nb;
-    }
-
-    FREE_PTR(str);
-}
-
-static void tx_mbuf_fast_free_handler(vector_t tokens)
-{
-    int val = -1;
-    char *str = set_value(tokens);
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    if (!strcasecmp(str, "off"))
-        val = 0;
-    else if (!strcasecmp(str, "on"))
-        val = 1;
-
-    if (val < 0) {
-        RTE_LOG(WARNING, NETIF, "invalid %s:tx_mbuf_fast_free, using default ON\n",
-                current_device->name);
-        current_device->tx_mbuf_fast_free = true;
-    } else {
-        current_device->tx_mbuf_fast_free = !!val;
-        RTE_LOG(INFO, NETIF, "%s:tx_mbuf_fast_free = %s\n", current_device->name, str);
-    }
-
-    FREE_PTR(str);
-}
-
-static void promisc_mode_handler(vector_t tokens)
-{
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-    current_device->promisc_mode = true;
-}
-
-static void allmulticast_handler(vector_t tokens)
-{
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-    current_device->allmulticast = true;
-}
-
-static void custom_mtu_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int mtu = 0;
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    mtu = atoi(str);
-    if (mtu <= 0 || mtu > NETIF_MAX_ETH_MTU) {
-        RTE_LOG(WARNING, NETIF, "invalid %s:MTU %s, using default %d\n",
-                current_device->name, str, NETIF_DEFAULT_ETH_MTU);
-        current_device->mtu= NETIF_DEFAULT_ETH_MTU;
-    } else {
-        RTE_LOG(INFO, NETIF, "%s:mtu = %d\n",
-                current_device->name, mtu);
-        current_device->mtu = mtu;
-    }
-
-    FREE_PTR(str);
-
-}
-static void kni_name_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    struct port_conf_stream *current_device = list_entry(port_list.next,
-            struct port_conf_stream, port_list_node);
-
-    assert(str);
-    RTE_LOG(INFO, NETIF, "%s:kni_name = %s\n",current_device->name, str);
-    strncpy(current_device->kni_name, str, sizeof(current_device->kni_name));
-
-    FREE_PTR(str);
-}
-
-static void bonding_handler(vector_t tokens)
-{
-    assert(VECTOR_SIZE(tokens) >= 1);
-
-    char *str;
-    struct bond_conf_stream *bond_cfg =
-        rte_zmalloc(NULL, sizeof(struct bond_conf_stream), RTE_CACHE_LINE_SIZE);
-    if (!bond_cfg) {
-        RTE_LOG(ERR, NETIF, "%s: no memory\n", __func__);
-        return;
-    }
-
-    bond_cfg->port_id = -1;
-    str = VECTOR_SLOT(tokens, 1);
-    RTE_LOG(INFO, NETIF, "netif bonding config: %s\n", str);
-    strncpy(bond_cfg->name, str, sizeof(bond_cfg->name));
-    bond_cfg->mode = NETIF_BOND_MODE_DEF;
-    bond_cfg->numa_node = NETIF_BOND_NUMA_NODE_DEF;
-    bond_cfg->options.dedicated_queues_enable = true;
-
-    list_add(&bond_cfg->bond_list_node, &bond_list);
-}
-
-static void bonding_mode_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int mode;
-    struct bond_conf_stream *current_bond = list_entry(bond_list.next,
-            struct bond_conf_stream, bond_list_node);
-
-    assert(str);
-    mode = atoi(str);
-    switch (mode) {
-        case BONDING_MODE_ROUND_ROBIN:
-        case BONDING_MODE_ACTIVE_BACKUP:
-        case BONDING_MODE_BALANCE:
-        case BONDING_MODE_BROADCAST:
-        case BONDING_MODE_8023AD:
-        case BONDING_MODE_TLB:
-        case BONDING_MODE_ALB:
-            RTE_LOG(INFO, NETIF, "bonding %s:mode=%d\n", current_bond->name, mode);
-            current_bond->mode = mode;
-            break;
-        default:
-            RTE_LOG(WARNING, NETIF, "invalid bonding %s:mode %d, using default %d\n",
-                    current_bond->name, mode, NETIF_BOND_MODE_DEF);
-            current_bond->mode = NETIF_BOND_MODE_DEF;
-    }
-
-    FREE_PTR(str);
-}
-
-static void bonding_slave_handler(vector_t tokens)
-{
-    int ii;
-    char *str = set_value(tokens);
-    struct bond_conf_stream *current_bond = list_entry(bond_list.next,
-            struct bond_conf_stream, bond_list_node);
-
-    assert(str);
-    if (get_port_conf_stream(str)) {
-        for (ii = 0; ii < NETIF_MAX_BOND_SLAVES; ii++) {
-            if (!current_bond->slaves[ii][0]) {
-                strncpy(current_bond->slaves[ii], str, sizeof(current_bond->slaves[ii]));
-                RTE_LOG(INFO, NETIF, "bonding %s:slave%d=%s\n", current_bond->name, ii, str);
-                break;
-            }
-        }
-    } else {
-        RTE_LOG(ERR, NETIF, "invalid bonding %s:salve %s, skip ...\n",
-                current_bond->name, str);
-    }
-
-    FREE_PTR(str);
-}
-
-static void bonding_primary_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    struct bond_conf_stream *current_bond = list_entry(bond_list.next,
-            struct bond_conf_stream, bond_list_node);
-
-    assert(str);
-    if (get_port_conf_stream(str)) {
-        RTE_LOG(INFO, NETIF, "bonding %s:primary=%s\n", current_bond->name, str);
-        strncpy(current_bond->primary, str, sizeof(current_bond->primary));
-    } else {
-        RTE_LOG(WARNING, NETIF, "invalid bonding %s:primary %s, skip ...\n",
-                current_bond->name, str);
-    }
-
-    FREE_PTR(str);
-}
-
-static void bonding_numa_node_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    int numa_node;
-    struct bond_conf_stream *current_bond = list_entry(bond_list.next,
-            struct bond_conf_stream, bond_list_node);
-    assert(str);
-
-    numa_node = atoi(str);
-    if (numa_node >= get_numa_nodes()) {
-        RTE_LOG(WARNING, NETIF, "invalid bonding %s:numa_node %d, using default %d\n",
-                current_bond->name, numa_node, NETIF_BOND_NUMA_NODE_DEF);
-        current_bond->mode = NETIF_BOND_NUMA_NODE_DEF;
-    } else {
-        RTE_LOG(INFO, NETIF, "bonding %s:numa_node=%d\n", current_bond->name, numa_node);
-        current_bond->numa_node = numa_node;
-    }
-
-    FREE_PTR(str);
-}
-
-static void bonding_kni_name_handler(vector_t tokens)
-{
-    char *str = set_value(tokens);
-    struct bond_conf_stream *current_bond = list_entry(bond_list.next,
-            struct bond_conf_stream, bond_list_node);
-
-    assert(str);
-    RTE_LOG(INFO, NETIF, "bonding %s:kni_name=%s\n", current_bond->name, str);
-    strncpy(current_bond->kni_name, str, sizeof(current_bond->kni_name));
-
-    FREE_PTR(str);
-}
-
-static inline char * get_bonding_option_value(char *token)
-{
-    char *ptr, *saveptr = NULL, *ret = token;
-
-    if (!token)
-        return NULL;
-
-    for (ptr = token; ret == token; ptr = NULL)
-        ret = strtok_r(ptr, "=", &saveptr);
-
-    return ret;
-}
-
-static void bonding_options_handler(vector_t tokens)
-{
-    char *str;
-    char *opt, *val, *ptr, *saveptr = NULL;
-
-    str = set_value(tokens);
-    struct bond_conf_stream *current_bond = list_entry(bond_list.next,
-            struct bond_conf_stream, bond_list_node);
-
-    assert(str);
-    RTE_LOG(INFO, NETIF, "bonding %s options: %s\n", current_bond->name, str);
-
-    for (ptr = str; ;ptr = NULL) {
-        opt = strtok_r(ptr, ";", &saveptr);
-        if (opt == NULL)
-            break;
-        val = get_bonding_option_value(opt);
-
-        if (!strcmp(opt, "dedicated_queues")) {
-            if (current_bond->mode != BONDING_MODE_8023AD || !val) {
-                RTE_LOG(WARNING, NETIF, "invalid bonding %s mode 4 option: %s, value: %s\n",
-                        current_bond->name, opt, val ?: "null");
-                continue;
-            }
-            if (!strcasecmp(val, "on") || !strcasecmp(val, "enable"))
-                current_bond->options.dedicated_queues_enable = true;
-            else if (!strcasecmp(val, "off") || !strcasecmp(val, "disable"))
-                current_bond->options.dedicated_queues_enable = false;
-            else
-                RTE_LOG(WARNING, NETIF, "invalid bonding %s option value: %s=%s\n",
-                        current_bond->name, opt, val);
-        } else {
-            RTE_LOG(WARNING, NETIF, "unsupported bonding %s option: %s\n",
-                    current_bond->name, opt);
-        }
     }
 
     FREE_PTR(str);
@@ -939,9 +482,6 @@ void netif_keyword_value_init(void)
         /* KW_TYPE_INIT keyword */
         netif_pktpool_nb_mbuf = NETIF_PKTPOOL_NB_MBUF_DEF;
         netif_pktpool_mbuf_cache = NETIF_PKTPOOL_MBUF_CACHE_DEF;
-#ifdef CONFIG_DPVS_FDIR
-        g_fdir_mode = RTE_FDIR_MODE_PERFECT;
-#endif
     }
     /* KW_TYPE_NORMAL keyword */
 }
@@ -951,38 +491,6 @@ void install_netif_keywords(void)
     install_keyword_root("netif_defs", netif_defs_handler);
     install_keyword("pktpool_size", pktpool_size_handler, KW_TYPE_INIT);
     install_keyword("pktpool_cache", pktpool_cache_handler, KW_TYPE_INIT);
-#ifdef CONFIG_DPVS_FDIR
-    install_keyword("fdir_mode", fdir_mode_handler, KW_TYPE_INIT);
-#endif
-    install_keyword("device", device_handler, KW_TYPE_INIT);
-    install_sublevel();
-    install_keyword("rx", NULL, KW_TYPE_INIT);
-    install_sublevel();
-    install_keyword("queue_number", rx_queue_number_handler, KW_TYPE_INIT);
-    install_keyword("descriptor_number", rx_desc_nb_handler, KW_TYPE_INIT);
-    install_keyword("rss", rss_handler, KW_TYPE_INIT);
-    install_sublevel_end();
-    install_keyword("tx", NULL, KW_TYPE_INIT);
-    install_sublevel();
-    install_keyword("queue_number", tx_queue_number_handler, KW_TYPE_INIT);
-    install_keyword("descriptor_number", tx_desc_nb_handler, KW_TYPE_INIT);
-    install_keyword("mbuf_fast_free", tx_mbuf_fast_free_handler, KW_TYPE_INIT);
-    install_sublevel_end();
-    install_keyword("promisc_mode", promisc_mode_handler, KW_TYPE_INIT);
-    install_keyword("allmulticast", allmulticast_handler, KW_TYPE_INIT);
-    install_keyword("mtu", custom_mtu_handler,KW_TYPE_INIT);
-    install_keyword("kni_name", kni_name_handler, KW_TYPE_INIT);
-    install_sublevel_end();
-    install_keyword("bonding", bonding_handler, KW_TYPE_INIT);
-    install_sublevel();
-    install_keyword("mode", bonding_mode_handler, KW_TYPE_INIT);
-    install_keyword("slave", bonding_slave_handler, KW_TYPE_INIT);
-    install_keyword("primary", bonding_primary_handler, KW_TYPE_INIT);
-    install_keyword("numa_node", bonding_numa_node_handler, KW_TYPE_INIT);
-    install_keyword("kni_name", bonding_kni_name_handler, KW_TYPE_INIT);
-    install_keyword("options", bonding_options_handler, KW_TYPE_INIT);
-    install_sublevel_end();
-
     install_keyword_root("worker_defs", worker_defs_handler);
     install_keyword("worker", worker_handler, KW_TYPE_INIT);
     install_sublevel();
@@ -1003,27 +511,13 @@ void install_netif_keywords(void)
 
 void netif_cfgfile_init(void)
 {
-    INIT_LIST_HEAD(&port_list);
-    INIT_LIST_HEAD(&bond_list);
     INIT_LIST_HEAD(&worker_list);
 }
 
 static void netif_cfgfile_term(void)
 {
-    struct port_conf_stream *port_cfg, *port_cfg_next;
-    struct bond_conf_stream *bond_cfg, *bond_cfg_next;
     struct worker_conf_stream *worker_cfg, *worker_cfg_next;
     struct queue_conf_stream *queue_cfg, *queue_cfg_next;
-
-    list_for_each_entry_safe(port_cfg, port_cfg_next, &port_list, port_list_node) {
-        list_del(&port_cfg->port_list_node);
-        rte_free(port_cfg);
-    }
-
-    list_for_each_entry_safe(bond_cfg, bond_cfg_next, &bond_list, bond_list_node) {
-        list_del(&bond_cfg->bond_list_node);
-        rte_free(bond_cfg);
-    }
 
     list_for_each_entry_safe(worker_cfg, worker_cfg_next, &worker_list,
             worker_list_node) {
@@ -1199,36 +693,15 @@ static struct list_head isol_rxq_tab[DPVS_MAX_LCORE];
 /* worker configuration array */
 static struct netif_lcore_conf lcore_conf[DPVS_MAX_LCORE + 1];
 
-/* Note: Lockless, lcore_conf is set on initialization stage by cfgfile /etc/dpvs.conf.
-config sample:
-static struct netif_lcore_conf lcore_conf[DPVS_MAX_LCORE + 1] = {
-    {.id = 1, .nports = 2, .pqs = {
-        {.id = 0, .nrxq = 1, .ntxq = 1, .rxqs = {{.id = 0, }, }, .txqs = {{.id = 0, }, }, },
-        {.id = 1, .nrxq = 0, .ntxq = 1, .txqs = {{.id = 0, }, }, }, },
-    },
-    {.id = 2, .nports = 2, .pqs = {
-        {.id = 0, .nrxq = 1, .ntxq = 1, .rxqs = {{.id = 1, }, }, .txqs = {{.id = 1, }, }, },
-        {.id = 1, .nrxq = 1, .ntxq = 2, .rxqs = {{.id = 0, }, }, .txqs = {{.id = 1, }, {.id = 4, }}, }, },
-    },
-    {.id = 3, .nports = 2, .pqs = {
-        {.id = 0, .nrxq = 2, .ntxq = 1, .rxqs = {{.id = 2, }, {.id = 3, }, }, .txqs = {{.id = 2, }, }, },
-        {.id = 1, .nrxq = 1, .ntxq = 2, .rxqs = {{.id = 1, }, }, .txqs = {{.id = 2, }, {.id = 3, }, }, }, },
-    },
-};
-*/
-
 static int isol_rxq_add(lcoreid_t cid, portid_t pid, queueid_t qid,
         unsigned rb_sz, struct netif_queue_conf *rxq);
 static void isol_rxq_del(struct rx_partner *isol_rxq, bool force);
 
 static void config_lcores(struct list_head *worker_list)
 {
-    int ii, tk;
+    int tk;
     int cpu_id_min, cpu_left, cpu_cnt;
     lcoreid_t id = 0;
-    portid_t pid;
-    struct netif_port *port;
-    struct queue_conf_stream *queue;
     struct worker_conf_stream *worker, *worker_next, *worker_min;
 
     memset(lcore_conf, 0, sizeof(lcore_conf));
@@ -1267,41 +740,6 @@ static void config_lcores(struct list_head *worker_list)
         else
             lcore_conf[id].type = LCORE_ROLE_IDLE;
 
-        list_for_each_entry_reverse(queue, &worker_min->port_list, queue_list_node) {
-            port = netif_port_get_by_name(queue->port_name);
-            if (port)
-                pid = port->id;
-            else
-                pid = NETIF_PORT_ID_INVALID;
-            lcore_conf[id].pqs[tk].id = pid;
-
-            for (ii = 0; queue->rx_queues[ii] != NETIF_MAX_QUEUES && ii < NETIF_MAX_QUEUES;
-                 ii++) {
-                lcore_conf[id].pqs[tk].rxqs[ii].id = queue->rx_queues[ii];
-                if (queue->isol_rxq_lcore_ids[ii] != NETIF_LCORE_ID_INVALID) {
-                    if (isol_rxq_add(queue->isol_rxq_lcore_ids[ii],
-                                port->id, queue->rx_queues[ii],
-                                queue->isol_rxq_ring_sz,
-                                &lcore_conf[id].pqs[tk].rxqs[ii]) < 0) {
-                        RTE_LOG(ERR, NETIF, "%s: isol_rxq add failed for cpu%d:%s:"
-                                "rx%d, recieving locally instead.\n", __func__,
-                                worker_min->cpu_id, port->name, queue->rx_queues[ii]);
-                    } else {
-                        RTE_LOG(INFO, NETIF, "%s: isol_rxq on cpu%d with ring size %d is "
-                                "added for cpu%d:%s:rx%d\n", __func__,
-                                queue->isol_rxq_lcore_ids[ii], queue->isol_rxq_ring_sz,
-                                worker_min->cpu_id, port->name, queue->rx_queues[ii]);
-                    }
-                }
-            }
-            lcore_conf[id].pqs[tk].nrxq = ii;
-
-            for (ii = 0; queue->tx_queues[ii] != NETIF_MAX_QUEUES && ii < NETIF_MAX_QUEUES;
-                 ii++)
-                lcore_conf[id].pqs[tk].txqs[ii].id = queue->tx_queues[ii];
-            lcore_conf[id].pqs[tk].ntxq = ii;
-            tk++;
-        }
         lcore_conf[id].nports = tk;
         id++;
 
@@ -1322,7 +760,9 @@ static int lcore_index_init(void)
     for (i = 0; i <= DPVS_MAX_LCORE; i++)
         lcore2index[i] = DPVS_MAX_LCORE;
 
-    for (i = 0; lcore_conf[i].nports > 0; i++) {
+    for (i = 0; i <= DPVS_MAX_LCORE; i++) {
+        if (lcore_conf[i].type != LCORE_ROLE_FWD_WORKER)
+            continue;
         cid = lcore_conf[i].id;
         if (!rte_lcore_is_enabled(cid))
             return EDPVS_NONEALCORE;
@@ -1374,7 +814,7 @@ void netif_get_slave_lcores(uint8_t *nb, uint64_t *mask)
     uint64_t slave_lcore_mask = 0L;
     uint8_t slave_lcore_nb = 0;
 
-    while (lcore_conf[i].nports > 0) {
+    while (i < DPVS_MAX_LCORE) {
         /* LCORE_ROLE_KNI_WORKER should be excluded,
          * as ports is configured for KNI core. */
         if (lcore_conf[i].type == LCORE_ROLE_FWD_WORKER) {
@@ -1472,7 +912,7 @@ static void lcore_role_init(void)
     g_lcore_role[cid] = LCORE_ROLE_MASTER;
 
     i = 0;
-    while (lcore_conf[i].nports > 0) {
+    while (lcore_conf[i].type) {
         cid = lcore_conf[i].id;
         assert(g_lcore_role[cid] == LCORE_ROLE_IDLE);
         g_lcore_role[cid] = lcore_conf[i].type;
@@ -1498,92 +938,6 @@ static inline void netif_copy_lcore_stats(struct netif_lcore_stats *stats)
     rte_memcpy(stats, &lcore_stats[cid], sizeof(struct netif_lcore_stats));
 }
 
-static int port_rx_queues_get(portid_t pid)
-{
-    int i = 0, j;
-    int rx_ports = 0;
-
-    while (lcore_conf[i].nports > 0) {
-        for (j = 0;  j < lcore_conf[i].nports; j++) {
-            if (lcore_conf[i].pqs[j].id == pid)
-                rx_ports += lcore_conf[i].pqs[j].nrxq;
-        }
-        i++;
-    }
-    return rx_ports;
-}
-
-static int port_tx_queues_get(portid_t pid)
-{
-    int i = 0, j;
-    int tx_ports = 0;
-
-    while (lcore_conf[i].nports > 0) {
-        for (j = 0;  j < lcore_conf[i].nports; j++) {
-            if (lcore_conf[i].pqs[j].id == pid)
-                tx_ports += lcore_conf[i].pqs[j].ntxq;
-        }
-        i++;
-    }
-    return tx_ports;
-}
-
-/*
- * params:
- *   @pid: [in] port id
- *   @qids: [out] queue id array containing rss queues when return
- *   @n_queues: [in,out], `qids` array length when input, rss queue number when return
- */
-static int get_configured_rss_queues(portid_t pid, queueid_t *qids, int *n_queues)
-{
-    int i, j, k, tk = 0;
-    if (!qids || !n_queues || *n_queues < NETIF_MAX_QUEUES)
-        return EDPVS_INVAL;
-
-    for (i = 0; lcore_conf[i].nports > 0; i++) {
-        if (lcore_conf[i].type != LCORE_ROLE_FWD_WORKER)
-            continue;
-        for (j = 0; j < lcore_conf[i].nports; j++) {
-            if (lcore_conf[i].pqs[j].id == pid)
-                break;
-        }
-        if (lcore_conf[i].pqs[j].id != pid)
-            return EDPVS_INVAL;
-        for (k = 0; k < lcore_conf[i].pqs[j].nrxq; k++) {
-            qids[tk++] = lcore_conf[i].pqs[j].txqs[k].id;
-            if (tk > *n_queues)
-                return EDPVS_NOMEM;
-        }
-    }
-    *n_queues = tk;
-    return EDPVS_OK;
-}
-
-static uint8_t get_configured_port_nb(int lcores, const struct netif_lcore_conf *lcore_conf)
-{
-    int i = 0, j, k;
-    uint8_t ports_nb = 0;
-    bool is_exist;
-    portid_t pid, ports_array[NETIF_MAX_PORTS];
-
-    while (lcore_conf[i].nports > 0 && i < lcores) {
-        for (j = 0; j < lcore_conf[i].nports; j++) {
-            pid = lcore_conf[i].pqs[j].id;
-            is_exist = false;
-            for (k = 0; k < ports_nb; k++) {
-                if (ports_array[k] == pid) {
-                    is_exist = true;
-                    break;
-                }
-            }
-            if (!is_exist)
-                ports_array[ports_nb++] = pid;
-        }
-        i++;
-    }
-    return ports_nb;
-}
-
 #define LCONFCHK_MARK                       255
 #define LCONFCHK_OK                         0
 #define LCONFCHK_REPEATED_RX_QUEUE_ID       -2
@@ -1595,72 +949,6 @@ static uint8_t get_configured_port_nb(int lcores, const struct netif_lcore_conf 
 
 static int check_lcore_conf(int lcores, const struct netif_lcore_conf *lcore_conf)
 {
-    int i = 0, j, k;
-    uint8_t nports, nqueues;
-    uint8_t nports_conf = get_configured_port_nb(lcores, lcore_conf);
-    portid_t pid;
-    queueid_t qid;
-    struct netif_lcore_conf mark;
-    memset(&mark, 0, sizeof(mark));
-    nports = dpvs_rte_eth_dev_count();
-    while (lcore_conf[i].nports > 0)
-    {
-        if (lcore_conf[i].nports > nports)
-            return LCONFCHK_PORT_NOT_ENOUGH;
-        for (j = 0; j < lcore_conf[i].nports; j++) {
-            pid = lcore_conf[i].pqs[j].id;
-            for (k = 0; k < lcore_conf[i].pqs[j].nrxq; k++) {
-                qid = lcore_conf[i].pqs[j].rxqs[k].id;
-                if (LCONFCHK_MARK == mark.pqs[pid].rxqs[qid].id) {
-                    RTE_LOG(ERR, NETIF, "rx qid: %d for cid: %d is already used.\n",
-                            qid, lcore_conf[i].id);
-                    return LCONFCHK_REPEATED_RX_QUEUE_ID;
-                } else
-                    mark.pqs[pid].rxqs[qid].id = LCONFCHK_MARK;
-            }
-            for (k = 0; k <lcore_conf[i].pqs[j].ntxq; k++) {
-                qid = lcore_conf[i].pqs[j].txqs[k].id;
-                if (LCONFCHK_MARK == mark.pqs[pid].txqs[qid].id) {
-                    RTE_LOG(ERR, NETIF, "tx qid: %d for cid: %d is already used.\n",
-                            qid, lcore_conf[i].id);
-                    return LCONFCHK_REPEATED_TX_QUEUE_ID;
-                } else
-                    mark.pqs[pid].txqs[qid].id = LCONFCHK_MARK;
-            }
-        }
-        if (++i >= lcores)
-            break;
-    }
-    if (i == 0)
-        return LCONFCHK_NO_SLAVE_LCORES;
-
-    for (i = 0; i < nports; i++) {
-        nqueues = port_rx_queues_get(i);
-        for (j = 0; j < nqueues; j++) {
-            //printf("[dpdk%d:rx%d] %d    ", i, j, mark.pqs[i].rxqs[j].id);
-            if (LCONFCHK_MARK != mark.pqs[i].rxqs[j].id) {
-                return LCONFCHK_DISCONTINUOUS_QUEUE_ID;
-            }
-        }
-        nqueues = port_tx_queues_get(i);
-        for (j = 0; j < nqueues; j++) {
-            //printf("[dpdk%d:tx%d] %d    ", i, j, mark.pqs[i].txqs[j].id);
-            if (LCONFCHK_MARK != mark.pqs[i].txqs[j].id) {
-                return LCONFCHK_DISCONTINUOUS_QUEUE_ID;
-            }
-        }
-    }
-
-    i = 0;
-    while (lcore_conf[i].nports > 0) {
-        if (lcore_conf[i].nports != nports_conf)
-            return LCONFCHK_INCORRECT_TX_QUEUE_NUM;
-        for (j = 0; j < lcore_conf[i].nports; j++)
-            if (lcore_conf[i].pqs[j].ntxq < 1)
-                return LCONFCHK_INCORRECT_TX_QUEUE_NUM;
-        if (++i >= lcores)
-            break;
-    }
     return LCONFCHK_OK;
 }
 
@@ -1850,129 +1138,6 @@ portid_t netif_max_pid;
 queueid_t netif_max_qid;
 struct port_queue_lcore_map pql_map[NETIF_MAX_PORTS];
 
-static int build_port_queue_lcore_map(void)
-{
-    int i, j, k;
-    lcoreid_t cid;
-    portid_t pid;
-    queueid_t qid;
-    int bflag = 0;
-    struct netif_port *dev;
-
-    /* init map struct */
-    for (i = 0; i < NETIF_MAX_PORTS; i++) {
-        pql_map[i].pid = NETIF_PORT_ID_INVALID;
-        snprintf(&pql_map[i].mac_addr[0], 18, "xx:xx:xx:xx:xx:xx");
-        for (j = 0; j < NETIF_MAX_QUEUES; j++) {
-            pql_map[i].rx_qid[j] = NETIF_PORT_ID_INVALID;
-            pql_map[i].tx_qid[j] = NETIF_PORT_ID_INVALID;
-        }
-    }
-
-    /* fill in map struct */
-    i = 0;
-    while (lcore_conf[i].nports > 0) {
-        cid = lcore_conf[i].id;
-        for (j = 0; j < lcore_conf[i].nports; j++) {
-            pid = lcore_conf[i].pqs[j].id;
-            if (pid > netif_max_pid)
-                netif_max_pid = pid;
-            if (pql_map[pid].pid == NETIF_PORT_ID_INVALID) {
-                pql_map[pid].pid = pid;
-
-                dev = netif_port_get(pid);
-                if (dev) {
-                    rte_ether_format_addr(pql_map[pid].mac_addr,
-                            sizeof(pql_map[pid].mac_addr), &dev->addr);
-                }
-            }
-            else if (pql_map[pid].pid != pid) {
-                RTE_LOG(ERR, NETIF, "%s: port id not consistent\n", __func__);
-                bflag = 1;
-                break;
-            }
-            for (k = 0; k < lcore_conf[i].pqs[j].nrxq; k++) {
-                qid = lcore_conf[i].pqs[j].rxqs[k].id;
-                if (qid > netif_max_qid)
-                    netif_max_qid = qid;
-                pql_map[pid].rx_qid[qid] = cid;
-            }
-            for (k = 0; k < lcore_conf[i].pqs[j].ntxq; k++) {
-                qid = lcore_conf[i].pqs[j].txqs[k].id;
-                if (qid > netif_max_qid)
-                    netif_max_qid = qid;
-                pql_map[pid].tx_qid[qid] = cid;
-            }
-        }
-        if (bflag)
-            break;
-        i++;
-    }
-    return EDPVS_OK;
-}
-
-int netif_print_lcore_conf(char *buf, int *len, bool is_all, portid_t pid)
-{
-    int i, j;
-    char tbuf[256], tbuf2[256], line[1024];
-    char rxbuf[16], txbuf[16];
-    int left_len;
-    struct netif_port *port;
-
-    /* format map in string */
-    memset(buf, 0, *len);
-    if (is_all) {
-        snprintf(line, sizeof(line) - 1, "    %-12s", "");
-        for (i = 0; i <= netif_max_pid; i++) {
-            port = netif_port_get(i);
-            assert(port);
-            snprintf(tbuf2, sizeof(tbuf2) - 1, "%s: %s ", port->name, pql_map[i].mac_addr);
-            snprintf(tbuf, sizeof(tbuf) - 1, "%-25s", tbuf2);
-            strncat(line, tbuf, sizeof(line) - strlen(line) - 1);
-        }
-        strncat(line, "\n", sizeof(line) - strlen(line) - 1);
-        left_len = *len - strlen(buf);
-        if (unlikely(left_len < 0)) {
-            RTE_LOG(WARNING, NETIF, "buffer not enough for '%s'\n", __func__);
-            *len = strlen(buf);
-            return EDPVS_INVAL;
-        }
-        strncat(buf, line, left_len - 1);
-    }
-
-    for (i = 0; i <= netif_max_qid; i++) {
-        snprintf(tbuf2, sizeof(tbuf2) - 1, "rx%d-tx%d", i, i);
-        snprintf(line, sizeof(line) - 1, "    %-12s", tbuf2);
-        for (j = 0; j <= netif_max_pid; j++) {
-            if (!is_all && pid != j)
-                continue;
-            if (NETIF_PORT_ID_INVALID == pql_map[j].rx_qid[i])
-                snprintf(rxbuf, sizeof(rxbuf) - 1, "xx");
-            else
-                snprintf(rxbuf, sizeof(rxbuf) - 1, "cpu%d", pql_map[j].rx_qid[i]);
-            if (NETIF_PORT_ID_INVALID == pql_map[j].tx_qid[i])
-                snprintf(txbuf, sizeof(txbuf) - 1, "xx");
-            else
-                snprintf(txbuf, sizeof(txbuf) - 1, "cpu%d", pql_map[j].tx_qid[i]);
-
-            snprintf(tbuf2, sizeof(tbuf2) - 1, "%s-%s", rxbuf, txbuf);
-            snprintf(tbuf, sizeof(tbuf) - 1, "%-25s", tbuf2);
-            strncat(line, tbuf, sizeof(line) - strlen(line) - 1);
-        }
-        strncat(line, "\n", sizeof(line) - strlen(line) - 1);
-        left_len = *len - strlen(buf);
-        if (unlikely(left_len <= 0)) {
-            RTE_LOG(WARNING, NETIF, "buffer not enough for '%s'\n", __func__);
-            *len = strlen(buf);
-            return EDPVS_INVAL;
-        }
-        strncat(buf, line, left_len - 1);
-    }
-
-    *len = strlen(buf);
-    return EDPVS_OK;
-}
-
 int netif_print_port_queue_conf(portid_t pid, char *buf, int *len)
 {
     int i, j;
@@ -2032,8 +1197,7 @@ int netif_print_port_queue_conf(portid_t pid, char *buf, int *len)
 
 int netif_print_lcore_queue_conf(lcoreid_t cid, char *buf, int *len, bool has_title)
 {
-    int i, j;
-    int max_queue;
+    int i;
     struct netif_port *port;
     struct netif_lcore_conf *plcore = NULL;
     char line[1024], tbuf[32], tbuf2[32];
@@ -2065,39 +1229,29 @@ int netif_print_lcore_queue_conf(lcoreid_t cid, char *buf, int *len, bool has_ti
     for (i = 0; i < plcore->nports; i++) {
         port = netif_port_get(plcore->pqs[i].id);
         assert(port);
-        max_queue = (plcore->pqs[i].nrxq > plcore->pqs[i].ntxq ?
-                plcore->pqs[i].nrxq : plcore->pqs[i].ntxq);
-        for (j = 0; j < max_queue; j++) {
-            memset(line, 0, sizeof(line));
-            if (has_title) {
-                snprintf(tbuf, sizeof(tbuf), "cpu%d", cid);
-                snprintf(line, sizeof(line), "%-12s", tbuf);
-            }
-
-            if (j < plcore->pqs[i].nrxq)
-                snprintf(tbuf2, sizeof(tbuf2), "%s:rx%d",
-                        port->name, plcore->pqs[i].rxqs[j].id);
-            else
-                snprintf(tbuf2, sizeof(tbuf2), "--");
-            snprintf(tbuf, sizeof(tbuf), "%-16s", tbuf2);
-            strncat(line, tbuf, sizeof(line) - strlen(line) -1);
-
-            if (j < plcore->pqs[i].ntxq)
-                snprintf(tbuf2, sizeof(tbuf2), "%s:tx%d",
-                        port->name, plcore->pqs[i].txqs[j].id);
-            else
-                snprintf(tbuf2, sizeof(tbuf2), "--");
-            snprintf(tbuf, sizeof(tbuf), "%-16s", tbuf2);
-            strncat(line, tbuf, sizeof(line) - strlen(line) - 1);
-
-            left_len = *len - strlen(buf) - 1;
-            if (left_len <= 0) {
-                RTE_LOG(WARNING, NETIF, "[%s] buffer not enough\n", __func__);
-                *len = strlen(buf) + 1;
-                return EDPVS_INVAL;
-            }
-            strncat(buf, line, left_len);
+        memset(line, 0, sizeof(line));
+        if (has_title) {
+            snprintf(tbuf, sizeof(tbuf), "cpu%d", cid);
+            snprintf(line, sizeof(line), "%-12s", tbuf);
         }
+
+        snprintf(tbuf2, sizeof(tbuf2), "%s:rx%d",
+                    port->name, plcore->pqs[i].rxq.id);
+        snprintf(tbuf, sizeof(tbuf), "%-16s", tbuf2);
+        strncat(line, tbuf, sizeof(line) - strlen(line) -1);
+
+        snprintf(tbuf2, sizeof(tbuf2), "%s:tx%d",
+                    port->name, plcore->pqs[i].txq.id);
+        snprintf(tbuf, sizeof(tbuf), "%-16s", tbuf2);
+        strncat(line, tbuf, sizeof(line) - strlen(line) - 1);
+
+        left_len = *len - strlen(buf) - 1;
+        if (left_len <= 0) {
+            RTE_LOG(WARNING, NETIF, "[%s] buffer not enough\n", __func__);
+            *len = strlen(buf) + 1;
+            return EDPVS_INVAL;
+        }
+        strncat(buf, line, left_len);
     }
 
     *len = strlen(buf) + 1;
@@ -2146,7 +1300,7 @@ static int netif_print_isol_lcore_conf(lcoreid_t cid, char *buf, int *len, bool 
     return EDPVS_OK;
 }
 
-static inline void netif_tx_burst(lcoreid_t cid, portid_t pid, queueid_t qindex)
+static inline void netif_tx_burst(lcoreid_t cid, portid_t pid)
 {
     int ntx;
     struct netif_queue_conf *txq;
@@ -2154,8 +1308,8 @@ static inline void netif_tx_burst(lcoreid_t cid, portid_t pid, queueid_t qindex)
     struct rte_mbuf *mbuf_copied = NULL;
     struct netif_port *dev = NULL;
 
-    assert(LCORE_ID_ANY != cid);
-    txq = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].txqs[qindex];
+    assert(cid < DPVS_MAX_LCORE);
+    txq = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].txq;
     if (0 == txq->len)
         return;
 
@@ -2258,23 +1412,13 @@ static inline int validate_xmit_mbuf(struct rte_mbuf *mbuf,
 {
     int err = EDPVS_OK;
 
-    /* 802.1q VLAN */
-    if (mbuf->ol_flags & RTE_AVP_TX_VLAN_PKT) {
-        if (!(dev->flag & NETIF_PORT_FLAG_TX_VLAN_INSERT_OFFLOAD)) {
-            err = vlan_insert_tag(mbuf, htons(ETH_P_8021Q),
-                                  mbuf_vlan_tag_get_id(mbuf));
-            mbuf->ol_flags &= (~RTE_AVP_TX_VLAN_PKT);
-            mbuf->vlan_tci = 0;
-        }
-    }
-
     return err;
 }
 
 int netif_hard_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 {
     lcoreid_t cid;
-    int pid, qindex, ntxq;
+    int pid;
     struct netif_queue_conf *txq;
     struct netif_ops *ops;
     int ret = EDPVS_OK;
@@ -2330,21 +1474,10 @@ int netif_hard_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 
     /* port id is determined by routing */
     pid = dev->id;
-    ntxq = lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].ntxq;
-    if (unlikely(ntxq <= 0)) {
-        RTE_LOG(WARNING, NETIF, "%s: no txq on device %s, drop the sending packet\n", __func__, dev->name);
-        rte_pktmbuf_free(mbuf);
-        lcore_stats[cid].dropped++;
-        return EDPVS_RESOURCE;
-    }
-    /* qindex is hashed by physical address of mbuf */
-    qindex = (((uint32_t) mbuf->buf_iova) >> 8) % ntxq;
-    //RTE_LOG(DEBUG, NETIF, "tx-queue hash(%x) = %d\n", ((uint32_t)mbuf->buf_iova) >> 8, qindex);
-    txq = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].txqs[qindex];
-
+    txq = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].txq;
     /* No space left in txq mbufs, transmit cached mbufs immediately */
     if (unlikely(txq->len == NETIF_MAX_PKT_BURST)) {
-        netif_tx_burst(cid, pid, qindex);
+        netif_tx_burst(cid, pid);
         txq->len = 0;
     }
 
@@ -2468,6 +1601,7 @@ int netif_rcv_mbuf(struct netif_port *dev, lcoreid_t cid, struct rte_mbuf *mbuf,
     int err;
     uint16_t data_off;
     bool forward2kni;
+    nsid_t nsid = dev->nsid;
 
     eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
     /*
@@ -2477,18 +1611,10 @@ int netif_rcv_mbuf(struct netif_port *dev, lcoreid_t cid, struct rte_mbuf *mbuf,
      */
 
     /*
-     * handle VLAN
-     * if HW offload vlan strip, it's still need vlan module
-     * to act as VLAN filter.
+     * drop VLAN
      */
-    if (eth_hdr->ether_type == htons(ETH_P_8021Q) ||
-            mbuf->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED) {
-        if (vlan_rcv(mbuf, netif_port_get(mbuf->port)) != EDPVS_OK)
-            goto drop;
-        dev = netif_port_get(mbuf->port);
-        if (unlikely(!dev))
-            goto drop;
-        eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    if (eth_hdr->ether_type == htons(ETH_P_8021Q)) {
+        goto drop;
     }
 
     forward2kni = (dev->flag & NETIF_PORT_FLAG_FORWARD2KNI) ? true : false;
@@ -2520,7 +1646,7 @@ int netif_rcv_mbuf(struct netif_port *dev, lcoreid_t cid, struct rte_mbuf *mbuf,
                             __func__, i);
                     continue;
                 }
-                err = rte_ring_enqueue(arp_ring[i], mbuf_clone);
+                err = rte_ring_enqueue(arp_ring[nsid][i], mbuf_clone);
                 if (unlikely(-EDQUOT == err)) {
                     RTE_LOG(WARNING, NETIF, "%s: arp ring of lcore %d quota exceeded\n",
                             __func__, i);
@@ -2568,16 +1694,18 @@ static int netif_arp_ring_init(void)
 {
     char name_buf[RTE_RING_NAMESIZE];
     int socket_id;
+    nsid_t nsid;
     uint8_t cid;
 
     socket_id = rte_socket_id();
-    for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
-        snprintf(name_buf, RTE_RING_NAMESIZE, "arp_ring_c%d", cid);
-        arp_ring[cid] = rte_ring_create(name_buf, ARP_RING_SIZE, socket_id, RING_F_SC_DEQ);
+    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++)
+        for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
+            snprintf(name_buf, RTE_RING_NAMESIZE, "arp_ring_ns%d_c%d", nsid, cid);
+            arp_ring[nsid][cid] = rte_ring_create(name_buf, ARP_RING_SIZE, socket_id, RING_F_SC_DEQ);
 
-        if (arp_ring[cid] == NULL)
-            rte_panic("create ring:%s failed!\n", name_buf);
-    }
+            if (arp_ring[nsid][cid] == NULL)
+                rte_panic("create ring:%s failed!\n", name_buf);
+        }
 
     return EDPVS_OK;
 }
@@ -2601,14 +1729,6 @@ void lcore_process_packets(struct rte_mbuf **mbufs, lcoreid_t cid, uint16_t coun
             continue;
         }
 
-        /* some protocols like LLDP may still like the originated port */
-        MBUF_USERDATA(mbuf, portid_t, MBUF_FIELD_ORIGIN_PORT) = mbuf->port;
-
-        if (unlikely(dev->type == PORT_TYPE_BOND_SLAVE)) {
-            dev = dev->bond->slave.master;
-            mbuf->port = dev->id;
-        }
-
         mbuf->tx_offload = 0; /* reset l2_len, l3_len, l4_len, ... */
 
         if (t < count) {
@@ -2621,12 +1741,12 @@ void lcore_process_packets(struct rte_mbuf **mbufs, lcoreid_t cid, uint16_t coun
     }
 }
 
-static void lcore_process_arp_ring(lcoreid_t cid)
+static void lcore_process_arp_ring(nsid_t nsid, lcoreid_t cid)
 {
     struct rte_mbuf *mbufs[NETIF_MAX_PKT_BURST];
     uint16_t nb_rb;
 
-    nb_rb = rte_ring_dequeue_burst(arp_ring[cid], (void**)mbufs, NETIF_MAX_PKT_BURST, NULL);
+    nb_rb = rte_ring_dequeue_burst(arp_ring[nsid][cid], (void**)mbufs, NETIF_MAX_PKT_BURST, NULL);
 
     if (nb_rb > 0) {
         lcore_process_packets(mbufs, cid, nb_rb, 1);
@@ -2640,35 +1760,38 @@ static void lcore_process_redirect_ring(lcoreid_t cid)
 
 static void lcore_job_recv_fwd(void *arg)
 {
-    int i, j;
+    int i;
     portid_t pid;
     lcoreid_t cid;
+    nsid_t nsid;
     struct netif_queue_conf *qconf;
 
     cid = rte_lcore_id();
-    assert(LCORE_ID_ANY != cid);
+    assert(DPVS_MAX_LCORE > cid);
 
     for (i = 0; i < lcore_conf[lcore2index[cid]].nports; i++) {
         pid = lcore_conf[lcore2index[cid]].pqs[i].id;
-        assert(pid <= bond_pid_end);
+        assert(pid <= phy_pid_end);
+        nsid = lcore_conf[lcore2index[cid]].pqs[i].nsid;
 
-        for (j = 0; j < lcore_conf[lcore2index[cid]].pqs[i].nrxq; j++) {
-            qconf = &lcore_conf[lcore2index[cid]].pqs[i].rxqs[j];
+        qconf = &lcore_conf[lcore2index[cid]].pqs[i].rxq;
 
-            lcore_process_arp_ring(cid);
-            lcore_process_redirect_ring(cid);
-            qconf->len = netif_rx_burst(pid, qconf);
+        lcore_process_arp_ring(nsid, cid);
+        lcore_process_redirect_ring(cid);
+        qconf->len = netif_rx_burst(pid, qconf);
 
-            lcore_stats_burst(&lcore_stats[cid], qconf->len);
+        lcore_stats_burst(&lcore_stats[cid], qconf->len);
 
-            lcore_process_packets(qconf->mbufs, cid, qconf->len, 0);
-        }
+        lcore_process_packets(qconf->mbufs, cid, qconf->len, 0);
+    }
+    if (unlikely(lcore_conf[lcore2index[cid]].nports == 0)) {
+        usleep(100);
     }
 }
 
 static void lcore_job_xmit(void *args)
 {
-    int i, j;
+    int i;
     lcoreid_t cid;
     portid_t pid;
     struct netif_queue_conf *qconf;
@@ -2682,13 +1805,11 @@ static void lcore_job_xmit(void *args)
             continue;
         }
 #endif
-        for (j = 0; j < lcore_conf[lcore2index[cid]].pqs[i].ntxq; j++) {
-            qconf = &lcore_conf[lcore2index[cid]].pqs[i].txqs[j];
-            if (qconf->len <= 0)
-                continue;
-            netif_tx_burst(cid, pid, j);
-            qconf->len = 0;
-        }
+        qconf = &lcore_conf[lcore2index[cid]].pqs[i].txq;
+        if (qconf->len <= 0)
+            continue;
+        netif_tx_burst(cid, pid);
+        qconf->len = 0;
     }
 }
 
@@ -2812,24 +1933,6 @@ static inline void netif_lcore_cleanup(void)
             RTE_LOG(WARNING, NETIF, "%s: fail to unregister lcore job '%s'\n",
                     __func__, netif_jobs[i].job.name);
     }
-}
-
-/* always update bond port macaddr and its KNI macaddr together */
-static int update_bond_macaddr(struct netif_port *port)
-{
-    assert(port->type == PORT_TYPE_BOND_MASTER);
-
-    if (rte_eth_macaddr_get(port->id, &port->addr))
-        return EDPVS_NOTEXIST;
-
-    if (kni_dev_exist(port)) {
-        /* if kni device isn't link up, linux_set_if_mac would fail(Timer expired),
-         * and in this case the warning can be ingored.*/
-        linux_set_if_mac(port->kni.name, (unsigned char *)&port->addr);
-        rte_ether_addr_copy(&port->addr, &port->kni.addr);
-    }
-
-    return EDPVS_OK;
 }
 
 static inline void free_mbufs(struct rte_mbuf **pkts, unsigned num)
@@ -2971,78 +2074,6 @@ static void kni_ingress_process(void)
     }
 }
 
-/*
- * note: kni_ingress_flow_xmit_vlan_trunk supports both vlan trunk and vlan access
- */
-static inline void kni_ingress_flow_xmit_vlan_trunk(struct netif_port *dev,
-            lcoreid_t cid, struct netif_queue_conf *qconf)
-{
-    int i, left, right, len;
-    unsigned pkt_total, pkt_sent;
-    struct rte_ether_hdr *eh;
-    struct rte_mbuf *mbuf;
-    struct netif_port *rdev;
-
-    for (i = 0; i < qconf->len; i++) {
-        // the received packets may from multiple vlans,
-        // we have to process them one by one
-        mbuf = qconf->mbufs[i];
-        eh = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-        if (eh->ether_type == htons(ETH_P_8021Q) ||
-                mbuf->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED) {
-            vlan_rcv(mbuf, dev);
-        } else if (dev->type == PORT_TYPE_BOND_MASTER) {
-            mbuf->port = dev->id;
-        }
-        /*
-         * The performance is astonishingly poor (as observed only about 3K pps,
-         * dozens multiple less than normal) if xmit packets to kni one at a time!
-         *
-        if (rte_kni_tx_burst(dev->kni.kni, qconf->mbufs, 1) != 1) {
-            rte_pktmbuf_free(qconf->mbufs[i]);
-            lcore_stats[cid].dropped++;
-        }
-        */
-    }
-
-    // reorder mbufs and xmit to kni in batch for each vlan
-    len = qconf->len;
-    while (len > 0) {
-        left = 0;
-        right = len - 1;
-        mbuf = qconf->mbufs[right];
-        while (left < right) {
-            while (left < right && qconf->mbufs[left]->port != mbuf->port)
-                left++;
-            qconf->mbufs[right] = qconf->mbufs[left];
-            while (left < right && qconf->mbufs[right]->port == mbuf->port)
-                right--;
-            qconf->mbufs[left] = qconf->mbufs[right];
-        }
-        qconf->mbufs[right] = mbuf;
-
-        rdev = netif_port_get(mbuf->port);
-        if (unlikely(!rdev || !kni_dev_running(rdev)))
-            rdev = dev;
-        pkt_total = len - right;
-        //pkt_sent = rte_kni_tx_burst(rdev->kni.kni, &qconf->mbufs[right], pkt_total);
-        pkt_sent = rte_ring_enqueue_bulk(rdev->kni.rx_ring,
-                    (void *const *)&qconf->mbufs[right], pkt_total, NULL);
-        if (unlikely(pkt_sent < pkt_total)) {
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-            RTE_LOG(INFO, NETIF, "%s: enqueue %d packets to kni %s, loss %.2f%%\n",
-                    __func__, pkt_total, rdev->kni.name,
-                    (pkt_total-pkt_sent)*100.0/pkt_total);
-#endif
-            free_mbufs(&(qconf->mbufs[right+pkt_sent]), pkt_total - pkt_sent);
-            lcore_stats[cid].dropped += pkt_total - pkt_sent;
-        }
-        len = right;
-    }
-
-    qconf->len = 0;
-}
-
 static inline void kni_ingress_flow_xmit_vlan_access(struct netif_port *dev,
             lcoreid_t cid, struct netif_queue_conf *qconf)
 {
@@ -3065,166 +2096,15 @@ static inline void kni_ingress_flow_xmit_vlan_access(struct netif_port *dev,
 }
 
 /*
- * Receive packets matched kni ip addresses with rte_flow from KNI worker
- */
-static void kni_ingress_flow_process(void)
-{
-    int i, j;
-    portid_t pid;
-    lcoreid_t cid;
-    struct netif_port *dev;
-    struct netif_queue_conf *qconf;
-
-    cid = rte_lcore_id(); // kni worker
-    assert(LCORE_ID_ANY != cid);
-
-    for (i = 0; i < lcore_conf[lcore2index[cid]].nports; i++) {
-        pid = lcore_conf[lcore2index[cid]].pqs[i].id;
-        assert(pid <= bond_pid_end);
-        dev = netif_port_get(pid);
-        if (!dev || !kni_dev_running(dev))
-            continue;
-        for (j = 0; j < lcore_conf[lcore2index[cid]].pqs[i].nrxq; j++) {
-            qconf = &lcore_conf[lcore2index[cid]].pqs[i].rxqs[j];
-            qconf->len = netif_rx_burst(pid, qconf);
-            lcore_stats_burst(&lcore_stats[cid], qconf->len);
-            if (!qconf->len)
-                continue;
-            if (dev->vlan_info)
-                kni_ingress_flow_xmit_vlan_trunk(dev, cid, qconf);
-            else
-                kni_ingress_flow_xmit_vlan_access(dev, cid, qconf);
-        }
-    }
-}
-
-/*
  * Use separate core to convey kni traffic if KNI lcore worker is configued.
  */
 void kni_lcore_loop(void *dummy)
 {
-    /* This is a lazy solution.
-     * It's better to schedule the tasks with an independent job on kni worker instead. */
-    if (g_kni_lcore_id != 0) {
-        kni_ingress_flow_process();
-        lcore_job_xmit(NULL);
-    }
-
     kni_ingress_process();
     kni_egress_process();
 }
 
 /********************************************* port *************************************************/
-
-static void netif_dump_rss_reta(struct netif_port *port)
-{
-    int i, len, pos;
-    uint32_t reta_id, reta_pos;
-    char buf[RTE_ETH_RSS_RETA_SIZE_512 * 8];
-    struct rte_eth_rss_reta_entry64 reta_info[RETA_CONF_SIZE];
-
-    if (port->type != PORT_TYPE_GENERAL && port->type != PORT_TYPE_BOND_SLAVE)
-        return;
-
-    if (unlikely(port->dev_info.reta_size == 0))
-        if (unlikely(rte_eth_dev_info_get(port->id, &port->dev_info)))
-            return;
-
-    memset(reta_info, 0, sizeof(reta_info));
-    for (i = 0; i < port->dev_info.reta_size; i++)
-        reta_info[i / RTE_ETH_RETA_GROUP_SIZE].mask = UINT64_MAX;
-
-    if (unlikely(rte_eth_dev_rss_reta_query(port->id, reta_info,
-                    port->dev_info.reta_size)))
-        return;
-
-    buf[0] = '\0';
-    len = pos = 0;
-    for (i = 0; i < port->dev_info.reta_size; i++) {
-        reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
-        reta_pos = i % RTE_ETH_RETA_GROUP_SIZE;
-        if (i % 8 == 0) {
-            len = snprintf(&buf[pos], sizeof(buf) - pos, "\n%4d: ", i);
-            if (len >= sizeof(buf) - pos) {
-                snprintf(&buf[sizeof(buf)-16], 16, "%s", "(truncated)");
-                break;
-            }
-            pos += len;
-        }
-        len = snprintf(&buf[pos], sizeof(buf)-pos, "%-4d", reta_info[reta_id].reta[reta_pos]);
-        if (len >= sizeof(buf) - pos) {
-            snprintf(&buf[sizeof(buf)-16], 16, "%s", "(truncated)");
-            break;
-        }
-        pos += len;
-    }
-
-    RTE_LOG(INFO, NETIF, "RSS RETA(%s):%s\n", port->name, buf);
-}
-
-static int __netif_update_rss_reta(struct netif_port *port)
-{
-    int i, err;
-    int nrssq = NETIF_MAX_QUEUES;
-    queueid_t rssq[NETIF_MAX_QUEUES];
-    uint32_t reta_id, reta_pos;
-    struct rte_eth_rss_reta_entry64 reta_conf[RETA_CONF_SIZE];
-
-    if (port->type != PORT_TYPE_GENERAL && port->type != PORT_TYPE_BOND_SLAVE)
-        return EDPVS_NOTSUPP;
-
-    if (port->type == PORT_TYPE_BOND_SLAVE)
-        err = get_configured_rss_queues(port->bond->slave.master->id, rssq, &nrssq);
-    else
-        err = get_configured_rss_queues(port->id, rssq, &nrssq);
-    if (err != EDPVS_OK)
-        return err;
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-    printf("RSS QUEUES(%s): ", port->name);
-    for (i = 0; i < nrssq; i++) {
-        printf("%-4d", rssq[i]);
-    }
-    printf("\n");
-#endif
-
-    memset(reta_conf, 0, sizeof(reta_conf));
-    for (i = 0; i < port->dev_info.reta_size; i++) {
-        reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
-        reta_pos = i % RTE_ETH_RETA_GROUP_SIZE;
-        reta_conf[reta_id].mask = UINT64_MAX;
-        reta_conf[reta_id].reta[reta_pos] = (uint16_t)(rssq[i % nrssq]);
-    }
-
-    if (rte_eth_dev_rss_reta_update(port->id, reta_conf, port->dev_info.reta_size))
-        return EDPVS_DPDKAPIFAIL;
-
-    netif_dump_rss_reta(port);
-    return EDPVS_OK;
-}
-
-static int netif_update_rss_reta(struct netif_port *port)
-{
-    switch (port->type) {
-        case PORT_TYPE_GENERAL:
-            return __netif_update_rss_reta(port);
-        case PORT_TYPE_BOND_MASTER:
-        {
-            // notes:
-            // rss reta of bonding slaves must be configured after bonding devices bootup,
-            // or it would be reset when bonding device bootup.
-            int i, err;
-            for (i = 0; i < port->bond->master.slave_nb; i++) {
-                err = __netif_update_rss_reta(port->bond->master.slaves[i]);
-                if (err != EDPVS_OK)
-                    return err;
-            }
-            return EDPVS_OK;
-        }
-        default:
-            return EDPVS_OK;
-    }
-}
-
 static inline int port_tab_hashkey(portid_t id)
 {
     return id & NETIF_PORT_TABLE_MASK;
@@ -3247,50 +2127,19 @@ static unsigned int port_ntab_hashkey(const char *name, size_t len)
 static inline void port_tab_init(void)
 {
     int i;
-    for (i = 0; i < NETIF_PORT_TABLE_BUCKETS; i++)
+    for (i = 0; i < NETIF_PORT_TABLE_BUCKETS; i++) {
+        rte_rwlock_init(&port_rwlock[i]);
         INIT_LIST_HEAD(&port_tab[i]);
+    }
 }
 
 static inline void port_ntab_init(void)
 {
     int i;
-    for (i = 0; i < NETIF_PORT_TABLE_BUCKETS; i++)
+    for (i = 0; i < NETIF_PORT_TABLE_BUCKETS; i++) {
+        rte_rwlock_init(&port_nrwlock[i]);
         INIT_LIST_HEAD(&port_ntab[i]);
-}
-
-static inline int port_name_alloc(portid_t pid, char *pname, size_t buflen)
-{
-    assert(pname && buflen > 0);
-    memset(pname, 0, buflen);
-    if (is_physical_port(pid)) {
-        struct port_conf_stream *current_cfg;
-        list_for_each_entry_reverse(current_cfg, &port_list, port_list_node) {
-            if (current_cfg->port_id < 0) {
-                current_cfg->port_id = pid;
-                if (current_cfg->name[0])
-                    snprintf(pname, buflen, "%s", current_cfg->name);
-                else
-                    snprintf(pname, buflen, "dpdk%d", pid);
-                return EDPVS_OK;
-            }
-        }
-        RTE_LOG(ERR, NETIF, "%s: not enough ports configured in dpvs.conf\n", __func__);
-        return EDPVS_NOTEXIST;
-    } else if (is_bond_port(pid)) {
-        struct bond_conf_stream *current_cfg;
-        list_for_each_entry_reverse(current_cfg, &bond_list, bond_list_node) {
-            if (current_cfg->port_id == pid) {
-                if (current_cfg->name[0])
-                    snprintf(pname, buflen, "%s", current_cfg->name);
-                else
-                    snprintf(pname, buflen, "bond%d", pid - bond_pid_base);
-                return EDPVS_OK;
-            }
-        }
-        return EDPVS_NOTEXIST;
     }
-
-    return EDPVS_INVAL;
 }
 
 static inline portid_t netif_port_id_alloc(void)
@@ -3314,7 +2163,7 @@ portid_t netif_port_count(void)
     return port_id_end;
 }
 
-struct netif_port *netif_alloc(portid_t id, size_t priv_size, const char *namefmt,
+struct netif_port *netif_alloc(nsid_t nsid, portid_t id, size_t priv_size, const char *namefmt,
                                unsigned int nrxq, unsigned int ntxq,
                                void (*setup)(struct netif_port *))
 {
@@ -3336,6 +2185,7 @@ struct netif_port *netif_alloc(portid_t id, size_t priv_size, const char *namefm
         RTE_LOG(ERR, NETIF, "%s: no memory\n", __func__);
         return NULL;
     }
+    dev->nsid = nsid;
 
     if (id != NETIF_PORT_ID_INVALID && !netif_port_get(id))
         dev->id = id;
@@ -3361,7 +2211,7 @@ struct netif_port *netif_alloc(portid_t id, size_t priv_size, const char *namefm
 
     /* virtual dev has no NUMA-node */
     if (dev->socket == SOCKET_ID_ANY)
-        dev->socket = rte_socket_id();
+        dev->socket = rte_lcore_to_socket_id(g_master_lcore_id);
     dev->mbuf_pool = pktmbuf_pool[dev->socket];
 
     if (memcmp(&dev->addr, &mac_zero, sizeof(dev->addr)) == 0) {
@@ -3396,33 +2246,19 @@ struct netif_port *netif_alloc(portid_t id, size_t priv_size, const char *namefm
 
 int netif_free(struct netif_port *dev)
 {
-    // TODO:
+    if (dev == NULL)
+        return EDPVS_OK;
+    tc_destroy_dev(dev);
+    if (dev->in_ptr)
+        rte_free(dev->in_ptr);
+    rte_free(dev);
     return EDPVS_OK;
 }
 
-static int bond_set_mc_list(struct netif_port *dev)
+int netif_free_todo(struct netif_port *dev)
 {
-    int i, err = EDPVS_OK;
-    struct netif_port *slave;
-
-    if (dev->type != PORT_TYPE_BOND_MASTER)
-        return EDPVS_INVAL;
-
-    for (i = 0; i < dev->bond->master.slave_nb; i++) {
-        slave = dev->bond->master.slaves[i];
-
-        rte_rwlock_write_lock(&slave->dev_lock);
-        err = __netif_mc_sync_multiple(slave, dev, dev->bond->master.slave_nb);
-        rte_rwlock_write_unlock(&slave->dev_lock);
-
-        if (err != EDPVS_OK) {
-            RTE_LOG(WARNING, NETIF, "%s: fail to sync %s's mcast list - %d\n",
-                    __func__, slave->name, err);
-            break;
-        }
-    }
-
-    return err;
+    // TODO:
+    return EDPVS_OK;
 }
 
 static int dpdk_set_mc_list(struct netif_port *dev)
@@ -3511,11 +2347,6 @@ static struct netif_ops dpdk_netif_ops = {
     .op_get_xstats       = netif_op_get_xstats,
 };
 
-static struct netif_ops bond_netif_ops = {
-    .op_update_addr      = update_bond_macaddr,
-    .op_set_mc_list      = bond_set_mc_list,
-    .op_get_xstats       = netif_op_get_xstats,
-};
 
 static inline void setup_dev_of_flags(struct netif_port *port)
 {
@@ -3579,11 +2410,14 @@ struct netif_port* netif_port_get(portid_t id)
     struct netif_port *port;
     assert(id <= NETIF_MAX_PORTS);
 
+    rte_rwlock_read_lock(&port_rwlock[hash]);
     list_for_each_entry(port, &port_tab[hash], list) {
         if (port->id == id) {
+            rte_rwlock_read_unlock(&port_rwlock[hash]);
             return port;
         }
     }
+    rte_rwlock_read_unlock(&port_rwlock[hash]);
 
     return NULL;
 }
@@ -3597,40 +2431,16 @@ struct netif_port* netif_port_get_by_name(const char *name)
         return NULL;
 
     nhash = port_ntab_hashkey(name, strlen(name));
+    rte_rwlock_read_lock(&port_nrwlock[nhash]);
     list_for_each_entry(port, &port_ntab[nhash], nlist) {
         if (!strcmp(port->name, name)) {
+            rte_rwlock_read_unlock(&port_nrwlock[nhash]);
             return port;
         }
     }
+    rte_rwlock_read_unlock(&port_nrwlock[nhash]);
 
     return NULL;
-}
-
-int netif_get_queue(struct netif_port *port, lcoreid_t cid, queueid_t *qid)
-{
-    static unsigned idx[DPVS_MAX_LCORE] = { 0 };
-    struct netif_port_conf *qconf;
-    static const unsigned IDX_MAX = (1 << sizeof(unsigned)) - 2;
-
-    assert(port && port->netif_ops && qid);
-
-    if (port->netif_ops->op_get_queue)
-        return port->netif_ops->op_get_queue(port, cid, qid);
-
-    /* for device (like dpdk/bonding) has lcore_conf */
-    *qid = NETIF_MAX_QUEUES;
-    if (unlikely(NULL == port || rte_lcore_is_enabled(cid) == 0))
-        return EDPVS_INVAL;
-
-    qconf = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][port->id]];
-    if (unlikely(!qconf->nrxq))
-        return EDPVS_INVAL;
-
-    if (++idx[cid] > IDX_MAX)
-        idx[cid] = 0;
-
-    *qid = qconf->rxqs[idx[cid] % qconf->nrxq].id;
-    return EDPVS_OK;
 }
 
 int netif_get_link(struct netif_port *dev, struct rte_eth_link *link)
@@ -3718,50 +2528,14 @@ int netif_port_conf_set(struct netif_port *port, const struct rte_eth_conf *conf
 
 static inline void port_mtu_set(struct netif_port *port)
 {
-    int ii;
-    uint16_t mtu, t_mtu;
+    uint16_t mtu;
 
     rte_eth_dev_get_mtu(port->id, &mtu);
 
-    if (port->type != PORT_TYPE_BOND_MASTER) {
-        port->mtu = mtu;
-        return;
-    }
-
-    for (ii = 0; ii < port->bond->master.slave_nb; ii++) {
-        t_mtu = 65535;
-        rte_eth_dev_get_mtu((uint8_t)port->bond->master.slaves[ii]->id, &t_mtu);
-        if (!mtu || t_mtu < mtu)
-            mtu = t_mtu;
-    }
     port->mtu = mtu;
 
     rte_eth_dev_set_mtu((uint8_t)port->id,port->mtu);
 
-}
-
-static int rss_resolve_proc(char *rss)
-{
-    int rss_value = 0;
-
-    if (!strcmp(rss, "all"))
-        rss_value = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP;
-    else if (!strcmp(rss, "ip"))
-        rss_value = RTE_ETH_RSS_IP;
-    else if (!strcmp(rss, "tcp"))
-        rss_value = RTE_ETH_RSS_TCP;
-    else if (!strcmp(rss, "udp"))
-        rss_value = RTE_ETH_RSS_UDP;
-    else if (!strcmp(rss, "sctp"))
-        rss_value = RTE_ETH_RSS_SCTP;
-    else if (!strcmp(rss, "ether"))
-        rss_value = RTE_ETH_RSS_L2_PAYLOAD;
-    else if (!strcmp(rss, "port"))
-        rss_value = RTE_ETH_RSS_PORT;
-    else if (!strcmp(rss, "tunnel"))
-        rss_value = RTE_ETH_RSS_TUNNEL;
-
-    return rss_value;
 }
 
 /* check and adapt device offloading/rss features */
@@ -3798,115 +2572,23 @@ static void adapt_device_conf(portid_t port_id, uint64_t *rss_hf,
     }
 }
 
-/* fill in rx/tx queue configurations, including queue number,
- * decriptor number, bonding device's rss */
+/* fill in rx/tx queue configurations, including queue number, decriptor number */
 static void fill_port_config(struct netif_port *port, char *promisc_on, char *allmulticast)
 {
     assert(port);
-    struct port_conf_stream *cfg_stream;
 
-    if (port->type == PORT_TYPE_BOND_SLAVE) {
-        /* bond slaves do not have worker configured */
-        port->nrxq = port_rx_queues_get(port->bond->slave.master->id);
-        port->ntxq = port_tx_queues_get(port->bond->slave.master->id);
-    } else {
-        port->nrxq = port_rx_queues_get(port->id);
-        port->ntxq = port_tx_queues_get(port->id);
-    }
+    port->nrxq = g_slave_lcore_num;
+    port->ntxq = g_slave_lcore_num;
 
-    cfg_stream = get_port_conf_stream(port->name);
 
     /* using default configurations */
     port->rxq_desc_nb = NETIF_NB_RX_DESC_DEF;
     port->txq_desc_nb = NETIF_NB_TX_DESC_DEF;
     port->mtu = NETIF_DEFAULT_ETH_MTU;
 
-    if (port->type == PORT_TYPE_BOND_MASTER) {
-        assert(port->bond->master.primary);
-
-        /* For some legacy broken DPDK PMD drivers whose flow_type_rss_offloads may not
-         * be filled but left zero in dev_info, that will cause the rss reconfiguration
-         * in DPDK's bond PMD driver slave_configure() disable the real physical NIC's
-         * rss. Since when start the real physical NICs before bond have done a correct
-         * configuration of the rss, a workaround is to leave out the rss reconfiguration
-         * in bonding if the flow_type_rss_offloads not be filled in PMD driver.
-         */
-        if (!port->bond->master.primary->dev_info.flow_type_rss_offloads)
-            port->dev_conf.rxmode.mq_mode = 0;
-
-        port->dev_conf.rx_adv_conf.rss_conf.rss_hf
-            = port->bond->master.primary->dev_conf.rx_adv_conf.rss_conf.rss_hf;
-        /* use primary conf for bonding */
-        cfg_stream = get_port_conf_stream(port->bond->master.primary->name);
-        if (cfg_stream) {
-            port->rxq_desc_nb = cfg_stream->rx_desc_nb;
-            port->txq_desc_nb = cfg_stream->tx_desc_nb;
-            port->mtu = cfg_stream->mtu;
-            if (cfg_stream->tx_mbuf_fast_free)
-                port->flag |= NETIF_PORT_FLAG_TX_MBUF_FAST_FREE;
-        } else {
-            port->rxq_desc_nb = NETIF_NB_RX_DESC_DEF;
-            port->txq_desc_nb = NETIF_NB_TX_DESC_DEF;
-            port->mtu = NETIF_DEFAULT_ETH_MTU;
-        }
-    }
-    /* enable promicuous mode if configured */
-    if (promisc_on) {
-        if (cfg_stream && cfg_stream->promisc_mode)
-            *promisc_on = 1;
-        else
-            *promisc_on = 0;
-    }
-    if (allmulticast) {
-        if (cfg_stream && cfg_stream->allmulticast)
-            *allmulticast = 1;
-        else
-            *allmulticast = 0;
-    }
+    *promisc_on = 1;
+    *allmulticast = 1;
 }
-
-static int add_bond_slaves(struct netif_port *port)
-{
-    assert(port->type == PORT_TYPE_BOND_MASTER);
-
-    int ii;
-    struct netif_port *slave;
-
-    for (ii = 0; ii < port->bond->master.slave_nb; ii++) {
-        slave = port->bond->master.slaves[ii];
-        if (rte_eth_bond_member_add(port->id, slave->id) < 0) {
-            RTE_LOG(ERR, NETIF, "%s: fail to add slave %s to %s\n", __func__,
-                    slave->name, port->name);
-            return EDPVS_DPDKAPIFAIL;
-        }
-    }
-
-    if (rte_eth_bond_primary_set(port->id, port->bond->master.primary->id) < 0) {
-        RTE_LOG(ERR, NETIF, "%s: fail to set slave %s as primary device of %s\n",
-                __func__, port->bond->master.primary->name, port->name);
-        return EDPVS_DPDKAPIFAIL;
-    } else {
-        RTE_LOG(INFO, NETIF, "%s: %s primary slave is %s\n",
-                __func__, port->name, port->bond->master.primary->name);
-    }
-
-    /* Add a MAC address to an internal array of addresses used to enable whitelist
-     * * filtering to accept packets only if the destination MAC address matches */
-    for (ii = 0; ii < port->bond->master.slave_nb; ii++) {
-        slave = port->bond->master.slaves[ii];
-        if (rte_eth_dev_mac_addr_add((uint8_t)slave->id, &port->addr, 0) < 0)
-            RTE_LOG(ERR, NETIF, "%s: fail to add bonding device %s's mac to %s\n",
-                    __func__, port->name, slave->name);
-    }
-
-    port->socket = rte_eth_dev_socket_id(port->id);
-    port->mbuf_pool = pktmbuf_pool[port->socket];
-    port_mtu_set(port);
-    rte_eth_dev_info_get(port->id, &port->dev_info);
-
-    return EDPVS_OK;
-}
-
 
 /*
  * Note: Invoke the function after port is allocated and lcores are configured.
@@ -3933,17 +2615,14 @@ int netif_port_start(struct netif_port *port)
 
     if (port->nrxq > port->dev_info.max_rx_queues ||
             port->ntxq > port->dev_info.max_tx_queues) {
-        rte_exit(EXIT_FAILURE, "%s: %s supports %d rx-queues and %d tx-queues at max, "
+        RTE_LOG(WARNING, NETIF,  "%s: %s supports %d rx-queues and %d tx-queues at max, "
                 "but %d rx-queues and %d tx-queues are configured.\n", __func__,
                 port->name, port->dev_info.max_rx_queues,
                 port->dev_info.max_tx_queues, port->nrxq, port->ntxq);
+        return EDPVS_RESOURCE;
     }
 
-#ifdef CONFIG_DPVS_FDIR
-    ret = config_fdir_conf(&port->dev_conf.fdir_conf);
-    if (ret != EDPVS_OK)
-        return ret;
-#endif
+
     if (port->flag & NETIF_PORT_FLAG_RX_IP_CSUM_OFFLOAD)
         port->dev_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
     if (port->flag & NETIF_PORT_FLAG_RX_VLAN_STRIP_OFFLOAD)
@@ -3988,13 +2667,6 @@ int netif_port_start(struct netif_port *port)
     if (port->ntxq > 0) {
         for (qid = 0; qid < port->ntxq; qid++) {
             memcpy(&txconf, &port->dev_info.default_txconf, sizeof(struct rte_eth_txconf));
-#if RTE_VERSION < RTE_VERSION_NUM(18, 11, 0, 0)
-            if (port->dev_conf.rxmode.jumbo_frame
-                    || (port->flag & NETIF_PORT_FLAG_TX_IP_CSUM_OFFLOAD)
-                    || (port->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD)
-                    || (port->flag & NETIF_PORT_FLAG_TX_TCP_CSUM_OFFLOAD))
-                txconf.txq_flags = 0;
-#endif
             txconf.offloads = port->dev_conf.txmode.offloads;
             ret = rte_eth_tx_queue_setup(port->id, qid, port->txq_desc_nb,
                     port->socket, &txconf);
@@ -4006,18 +2678,8 @@ int netif_port_start(struct netif_port *port)
         }
     }
 
-    // add slaves and update stored info for bonding device
-    if (port->type == PORT_TYPE_BOND_MASTER) {
-        ret = add_bond_slaves(port);
-        if (ret != EDPVS_OK)
-            return ret;
-    }
-
     netif_print_port_conf(&port->dev_conf, buf, &buflen);
     RTE_LOG(INFO, NETIF, "device %s configuration:\n%s\n", port->name, buf);
-
-    // build port-queue-lcore mapping array
-    build_port_queue_lcore_map();
 
     // start the device
     ret = rte_eth_dev_start(port->id);
@@ -4062,17 +2724,7 @@ int netif_port_start(struct netif_port *port)
     if (port->netif_ops->op_update_addr)
         port->netif_ops->op_update_addr(port);
 
-    /* ipv6 default addresses initialization */
-    if ((ret = idev_addr_init(port->in_ptr)) != EDPVS_OK) {
-        RTE_LOG(WARNING, NETIF, "%s: idev_addr_init failed -- %d(%s)\n",
-                __func__, ret, dpvs_strerror(ret));
-        return ret;
-    }
 
-    /* update rss reta */
-    if ((ret = netif_update_rss_reta(port)) != EDPVS_OK)
-        RTE_LOG(WARNING, NETIF, "%s: %s update rss reta failed (cause: %s)\n",
-                __func__, port->name, dpvs_strerror(ret));
 
 #if 0
     /* disable kni tx-csum offload feature
@@ -4095,12 +2747,9 @@ int netif_port_stop(struct netif_port *port)
     if (unlikely(NULL == port))
         return EDPVS_INVAL;
 
-    if (kni_dev_exist(port))
-        kni_del_dev(port);
-
     rte_eth_dev_stop(port->id);
     ret = rte_eth_dev_set_link_down(port->id);
-    if (ret < 0) {
+    if (ret < 0 && ret != -ENOTSUP) {
         RTE_LOG(WARNING, NETIF, "%s: fail to set %s link down\n", __func__, port->name);
         return EDPVS_DPDKAPIFAIL;
     }
@@ -4119,21 +2768,27 @@ int netif_port_register(struct netif_port *port)
         return EDPVS_INVAL;
 
     hash = port_tab_hashkey(port->id);
+    rte_rwlock_write_lock(&port_rwlock[hash]);
     list_for_each_entry(cur, &port_tab[hash], list) {
         if (cur->id == port->id || strcmp(cur->name, port->name) == 0) {
+            rte_rwlock_write_unlock(&port_rwlock[hash]);
             return EDPVS_EXIST;
         }
     }
+    list_add_tail(&port->list, &port_tab[hash]);
+    rte_rwlock_write_unlock(&port_rwlock[hash]);
 
     nhash = port_ntab_hashkey(port->name, sizeof(port->name));
-    list_for_each_entry(cur, &port_ntab[hash], nlist) {
+    rte_rwlock_write_lock(&port_nrwlock[nhash]);
+    list_for_each_entry(cur, &port_ntab[nhash], nlist) {
         if (cur->id == port->id || strcmp(cur->name, port->name) == 0) {
+            rte_rwlock_write_unlock(&port_nrwlock[nhash]);
             return EDPVS_EXIST;
         }
     }
-
-    list_add_tail(&port->list, &port_tab[hash]);
     list_add_tail(&port->nlist, &port_ntab[nhash]);
+    rte_rwlock_write_unlock(&port_nrwlock[nhash]);
+
     g_nports++;
 
     if (port->netif_ops->op_init) {
@@ -4156,6 +2811,7 @@ int netif_port_unregister(struct netif_port *port)
     ret1 = ret2 = EDPVS_NOTEXIST;
 
     hash = port_tab_hashkey(port->id);
+    rte_rwlock_write_lock(&port_rwlock[hash]);
     list_for_each_entry_safe(cur, next, &port_tab[hash], list) {
         if (cur->id == port->id || strcmp(cur->name, port->name) == 0) {
             list_del_init(&cur->list);
@@ -4163,8 +2819,10 @@ int netif_port_unregister(struct netif_port *port)
             break;
         }
     }
+    rte_rwlock_write_unlock(&port_rwlock[hash]);
 
     nhash = port_ntab_hashkey(port->name, sizeof(port->name));
+    rte_rwlock_write_lock(&port_nrwlock[nhash]);
     list_for_each_entry_safe(cur, next, &port_ntab[nhash], nlist) {
         if (cur->id == port->id || strcmp(cur->name, port->name) == 0) {
             list_del_init(&cur->nlist);
@@ -4172,6 +2830,7 @@ int netif_port_unregister(struct netif_port *port)
             break;
         }
     }
+    rte_rwlock_write_unlock(&port_nrwlock[nhash]);
 
     if (ret1 != EDPVS_OK || ret2 != EDPVS_OK)
         return EDPVS_NOTEXIST;
@@ -4180,56 +2839,6 @@ int netif_port_unregister(struct netif_port *port)
     return EDPVS_OK;
 }
 
-/* FIXME: port_id in cfgfile file is not consistent with correspondings in program, if
- * port id not sequentially resided in cfgfile. If so, fill_bonding_device is problematic. */
-static int relate_bonding_device(void)
-{
-    int i;
-    struct bond_conf_stream *bond_conf;
-    struct netif_port *mport, *sport;
-
-    list_for_each_entry_reverse(bond_conf, &bond_list, bond_list_node) {
-        mport = netif_port_get_by_name(bond_conf->name);
-        if (!mport) {
-            RTE_LOG(ERR, NETIF, "%s: bonding master device %s not found\n",
-                    __func__, bond_conf->name);
-            return EDPVS_NOTEXIST;
-        }
-        assert(mport->type == PORT_TYPE_BOND_MASTER);
-        mport->bond->master.mode = bond_conf->mode;
-        for (i = 0; bond_conf->slaves[i][0] && i < NETIF_MAX_BOND_SLAVES; i++) {
-            sport = netif_port_get_by_name(bond_conf->slaves[i]);
-            if (!sport) {
-                RTE_LOG(ERR, NETIF, "%s: bonding slave device %s not found\n",
-                        __func__, bond_conf->slaves[i]);
-                return EDPVS_NOTEXIST;
-            }
-            if (sport->bond->slave.master) {
-                RTE_LOG(ERR, NETIF, "%s: device %s is slave of %s already\n",
-                        __func__, bond_conf->slaves[i], sport->bond->slave.master->name);
-                return EDPVS_EXIST;
-            }
-            mport->bond->master.slaves[i] = sport;
-            if (!strcmp(bond_conf->slaves[i], bond_conf->primary)) {
-                mport->bond->master.primary = sport;
-                rte_ether_addr_copy(&sport->addr, &mport->addr);  /* use primary slave's macaddr for bonding */
-            }
-            assert(sport->type == PORT_TYPE_GENERAL);
-            if (sport->socket != mport->socket) {
-                /* FIXME: all slaves share the same socket with master, otherwise kernel crash */
-                RTE_LOG(WARNING, NETIF, "%s: %s is created on numa node %d, while its slave %s"
-                        " is on numa node %d\n", __func__, mport->name, mport->socket,
-                        sport->name, sport->socket);
-                sport->socket = mport->socket;
-            }
-            sport->type = PORT_TYPE_BOND_SLAVE;
-            sport->bond->slave.master = mport;
-            sport->in_ptr->flags |= IDEV_F_NO_ROUTE;
-        }
-        mport->bond->master.slave_nb = i;
-    }
-    return EDPVS_OK;
-}
 
 static struct rte_eth_conf default_port_conf = {
     .rxmode = {
@@ -4283,45 +2892,12 @@ int netif_print_port_conf(const struct rte_eth_conf *port_conf, char *buf, int *
     return EDPVS_OK;
 }
 
-static char *find_conf_kni_name(portid_t id)
-{
-    struct port_conf_stream *port_cfg;
-    struct bond_conf_stream *bond_cfg;
-
-    list_for_each_entry(port_cfg, &port_list, port_list_node) {
-        if (port_cfg->port_id == id)
-            return port_cfg->kni_name;
-    }
-
-    list_for_each_entry(bond_cfg, &bond_list, bond_list_node) {
-        if (bond_cfg->port_id == id)
-            return bond_cfg->kni_name;
-    }
-
-    return NULL;
-}
-
-static void dpdk_port_setup(struct netif_port *dev)
+void dpdk_port_setup(struct netif_port *dev)
 {
     dev->type      = PORT_TYPE_GENERAL;
     dev->netif_ops = &dpdk_netif_ops;
     dev->socket    = rte_eth_dev_socket_id(dev->id);
     dev->dev_conf  = default_port_conf;
-    dev->bond      = (union netif_bond *)(dev + 1);
-
-    rte_eth_macaddr_get(dev->id, &dev->addr);
-    rte_eth_dev_get_mtu(dev->id, &dev->mtu);
-    rte_eth_dev_info_get(dev->id, &dev->dev_info);
-    setup_dev_of_flags(dev);
-}
-
-static void bond_port_setup(struct netif_port *dev)
-{
-    dev->type      = PORT_TYPE_BOND_MASTER;
-    dev->netif_ops = &bond_netif_ops;
-    dev->socket    = rte_eth_dev_socket_id(dev->id);
-    dev->dev_conf  = default_port_conf;
-    dev->bond      = (union netif_bond *)(dev + 1);
 
     rte_eth_macaddr_get(dev->id, &dev->addr);
     rte_eth_dev_get_mtu(dev->id, &dev->mtu);
@@ -4332,181 +2908,42 @@ static void bond_port_setup(struct netif_port *dev)
 /* Allocate and register all DPDK ports available */
 static void netif_port_init(void)
 {
-    int nports, nports_cfg;
-    portid_t pid;
-    struct netif_port *port;
-    char *kni_name;
-    char ifname[IFNAMSIZ];
-
-    nports = dpvs_rte_eth_dev_count();
-    if (nports <= 0)
-        rte_exit(EXIT_FAILURE, "No dpdk ports found!\n"
-                "Possibly nic or driver is not dpdk-compatible.\n");
-
-    nports_cfg = list_elems(&port_list) + list_elems(&bond_list);
-    if (nports_cfg < nports)
-        rte_exit(EXIT_FAILURE, "ports in DPDK RTE (%d) != ports in dpvs.conf(%d)\n",
-                nports, nports_cfg);
 
     port_tab_init();
     port_ntab_init();
 
-    kni_init();
+    // portid_t pid;
+    // struct netif_port *port;
+    // char *kni_name;
+    // char ifname[IFNAMSIZ];
 
-    for (pid = 0; pid < nports; pid++) {
-        if (port_name_alloc(pid, ifname, sizeof(ifname)) != EDPVS_OK)
-            rte_exit(EXIT_FAILURE, "Port name allocation failed, exiting...\n");
+    // for (pid = 0; pid < nports; pid++) {
+    //     if (port_name_alloc(pid, ifname, sizeof(ifname)) != EDPVS_OK)
+    //         rte_exit(EXIT_FAILURE, "Port name allocation failed, exiting...\n");
 
-        /* queue number will be filled on device start */
-        port = NULL;
-        if (is_physical_port(pid))
-            port = netif_alloc(pid, sizeof(union netif_bond), ifname, 0, 0, dpdk_port_setup);
-        else if (is_bond_port(pid))
-            port = netif_alloc(pid, sizeof(union netif_bond), ifname, 0, 0, bond_port_setup);
-        if (!port)
-            rte_exit(EXIT_FAILURE, "Port allocation failed, exiting...\n");
-        port->nsid = nsid_get(pid);
-        if (netif_port_register(port) < 0)
-            rte_exit(EXIT_FAILURE, "Port registration failed, exiting...\n");
-    }
+    //     /* queue number will be filled on device start */
+    //     port = NULL;
+    //     if (is_physical_port(pid))
+    //         port = netif_alloc(pid, 0, ifname, 0, 0, dpdk_port_setup);
+    //     if (!port)
+    //         rte_exit(EXIT_FAILURE, "Port allocation failed, exiting...\n");
+    //     port->nsid = nsid_get(pid);
+    //     if (netif_port_register(port) < 0)
+    //         rte_exit(EXIT_FAILURE, "Port registration failed, exiting...\n");
+    // }
 
-    if (relate_bonding_device() < 0)
-        rte_exit(EXIT_FAILURE, "relate_bonding_device fail, exiting...\n");
+    // /* auto generate KNI device for all build-in
+    //  * phy ports and bonding master ports, but not bonding slaves */
+    // for (pid = 0; pid < nports; pid++) {
+    //     port = netif_port_get(pid);
+    //     assert(port);
 
-    /* auto generate KNI device for all build-in
-     * phy ports and bonding master ports, but not bonding slaves */
-    for (pid = 0; pid < nports; pid++) {
-        port = netif_port_get(pid);
-        assert(port);
+    //     kni_name = find_conf_kni_name(pid);
 
-        if (port->type == PORT_TYPE_BOND_SLAVE)
-            continue;
-
-        kni_name = find_conf_kni_name(pid);
-
-        /* it's ok if no KNI name (kni_name is NULL) */
-        if (kni_add_dev(port, kni_name) < 0)
-            rte_exit(EXIT_FAILURE, "add KNI port fail, exiting...\n");
-    }
-}
-
-/******************************************* module ***********************************************/
-
-/*! \brief obtain DPDK bond device name
- *
- *  obtain new DPDK bond device name to fit with DPDK 17.11
- *
- * \param dst obtained new DPDK device name
- * \param ori original bond device name from config
- * \param size device name max length
- * \return EDPVS_OK if success
- */
-static int obtain_dpdk_bond_name(char *dst, const char *ori, size_t size)
-{
-    char str[IFNAMSIZ];
-    unsigned num;
-
-    if (!ori || sscanf(ori, "%[_a-zA-Z]%u", str, &num) != 2)
-        return EDPVS_INVAL;
-
-    /*
-     * DPDK need bonding device name start with "net_bonding"
-     * to match the driver.
-     */
-    snprintf(dst, size, "net_bonding%u", num);
-
-    return EDPVS_OK;
-}
-
-/*
- * netif_virtual_devices_add must be called before lcore_init and port_init,
- * so it's recommended to call this function immediately after cfgfile_init.
- */
-int netif_vdevs_add(void)
-{
-    int ret;
-    struct bond_conf_stream *bond_cfg;
-
-#ifdef NETIF_BONDING_DEBUG
-    int ii, len = 0;
-    char slavenames[NETIF_MAX_BOND_SLAVES*IFNAMSIZ];
-    list_for_each_entry_reverse(bond_cfg, &bond_list, bond_list_node) {
-        for (ii = 0; ii < NETIF_MAX_BOND_SLAVES && bond_cfg->slaves[ii][0]; ii++) {
-            ret = snprintf(&slavenames[len], sizeof(slavenames)-len-1, "%s ", bond_cfg->slaves[ii]);
-            if (ret >= 0)
-                len += ret;
-        }
-        RTE_LOG(DEBUG, NETIF, "Add bonding device \"%s\""
-                "\n\tmode: %d"
-                "\n\tprimary: %s"
-                "\n\tnuma_node: %d"
-                "\n\tslaves: %s\n",
-                bond_cfg->name,
-                bond_cfg->mode,
-                bond_cfg->primary[0] ? bond_cfg->primary : ii > 0 ? bond_cfg->slaves[0] : "",
-                bond_cfg->numa_node,
-                slavenames);
-    }
-#endif
-
-    /* set phy_pid_end/bond_pid_base before create bonding device */
-    phy_pid_end = dpvs_rte_eth_dev_count();
-    port_id_end = max(port_id_end, phy_pid_end);
-    if (!list_empty(&bond_list))
-        bond_pid_base = phy_pid_end;
-
-    list_for_each_entry_reverse(bond_cfg, &bond_list, bond_list_node) {
-        char bondname[IFNAMSIZ] = {'\0'};
-
-        if (!bond_cfg->slaves[0][0]) {
-            RTE_LOG(WARNING, NETIF, "%s: no slaves configured for %s, skip ...\n",
-                    __func__, bond_cfg->name);
-            return EDPVS_INVAL;
-        }
-
-        /* use the first slave as primary if not configured */
-        if (!bond_cfg->primary[0]) {
-            RTE_LOG(INFO, NETIF, "%s: %s primary slave is not configured, using %s\n",
-                    __func__, bond_cfg->name, bond_cfg->slaves[0]);
-            strncpy(bond_cfg->primary, bond_cfg->slaves[0], sizeof(bond_cfg->primary));
-        }
-
-        ret = obtain_dpdk_bond_name(bondname, bond_cfg->name, IFNAMSIZ);
-        if (ret != EDPVS_OK) {
-            RTE_LOG(ERR, NETIF, "%s: invalid bonding device name in config file %s\n",
-                    __func__, bond_cfg->name);
-            return EDPVS_INVAL;
-        }
-
-        /* Note that all slaves' numa nodes should be the same as the one of bonding,
-         * otherwise the bonding and slaves cannot link up. Nevertheless, if you are
-         * to use slaves from different numa nodes, the dpdk patch
-         *      [bonding: allow slaves from different numa nodes]
-         * should be applied, which may cause negative influence on performance. */
-        ret = rte_eth_bond_create(bondname, bond_cfg->mode, bond_cfg->numa_node);
-        if (ret < 0) {
-            RTE_LOG(ERR, NETIF, "%s: fail to create bonding device %s: mode=%d, numa_node=%d\n",
-                    __func__, bond_cfg->name, bond_cfg->mode, bond_cfg->numa_node);
-            return EDPVS_CALLBACKFAIL;
-        }
-        bond_cfg->port_id = ret; /* relate port_id with port_name, used by port_name_alloc */
-        RTE_LOG(INFO, NETIF, "created bondig device %s: mode=%d, primary=%s, numa_node=%d\n",
-                bond_cfg->name, bond_cfg->mode, bond_cfg->primary, bond_cfg->numa_node);
-
-        if (bond_cfg->mode == BONDING_MODE_8023AD && bond_cfg->options.dedicated_queues_enable) {
-            if (rte_eth_bond_8023ad_dedicated_queues_enable(bond_cfg->port_id)) {
-                RTE_LOG(INFO, NETIF, "%s: bonding mode4 dedicated queues enable failed!\n", __func__);
-            }
-        }
-    }
-
-    if (!list_empty(&bond_list)) {
-        bond_pid_end = dpvs_rte_eth_dev_count();
-        port_id_end = max(port_id_end, bond_pid_end);
-        RTE_LOG(INFO, NETIF, "bonding device port id range: [%d, %d)\n", bond_pid_base, bond_pid_end);
-    }
-
-    return EDPVS_OK;
+    //     /* it's ok if no KNI name (kni_name is NULL) */
+    //     if (kni_add_dev(port, kni_name) < 0)
+    //         rte_exit(EXIT_FAILURE, "add KNI port fail, exiting...\n");
+    // }
 }
 
 int netif_init(void)
@@ -4638,6 +3075,57 @@ static inline int lcore_stats_msg_init(void)
     return EDPVS_OK;
 }
 
+static int netif_add_msg_cb(struct dpvs_msg *msg)
+{
+    int cid = rte_lcore_id();
+    struct netif_port *port = *((struct netif_port**) msg->data);
+
+    int lcore_index = lcore2index[cid];
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[lcore_index];
+    int port_index = local_lcore_conf->nports;
+    struct netif_port_conf *new_port = &(local_lcore_conf->pqs[port_index]);
+
+    RTE_LOG(INFO, NETIF, "[%02d] %s: add netif %s\n", cid, __func__, port->name); 
+
+    new_port->id = port->id;
+    new_port->nsid = port->nsid;
+    new_port->rxq.len = 0;
+    new_port->rxq.isol_rxq = NULL;
+    new_port->rxq.id = lcore_index;
+
+    port2index[cid][port->id] = port_index;
+
+    local_lcore_conf->nports++;
+
+    return EDPVS_OK;
+}
+
+static inline int netif_msg_init(void)
+{
+    int ii, err;
+    struct dpvs_msg_type lcore_stats_msg_type = {
+        .type = MSG_TYPE_NETIF_ADD,
+        .mode = DPVS_MSG_UNICAST,
+        .prio = MSG_PRIO_NORM,
+        .unicast_msg_cb = netif_add_msg_cb,
+        .multicast_msg_cb = NULL,
+    };
+
+    for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
+        if (g_slave_lcore_mask & (1L << ii)) {
+            lcore_stats_msg_type.cid = ii;
+            err = msg_type_register(&lcore_stats_msg_type);
+            if (EDPVS_OK != err) {
+                RTE_LOG(WARNING, NETIF, "[%s] fail to register MSG_TYPE_NETIF_ADD msg-type "
+                        "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
+                return err;
+            }
+        }
+    }
+
+    return EDPVS_OK;
+}
+
 static inline int lcore_stats_msg_term(void)
 {
     int ii, err;
@@ -4745,10 +3233,9 @@ static int get_port_list(nsid_t nsid, void **out, size_t *out_len)
 
     get->phy_pid_base = phy_pid_base;
     get->phy_pid_end = phy_pid_end;
-    get->bond_pid_base = bond_pid_base;
-    get->bond_pid_end = bond_pid_end;
 
     for (i = 0; i < NETIF_PORT_TABLE_BUCKETS; i++) {
+        rte_rwlock_read_lock(&port_rwlock[i]);
         list_for_each_entry(port, &port_tab[i], list) {
             if (nsid != NAMESPACE_ID_ALL && port->nsid != nsid) {
                 continue;
@@ -4763,6 +3250,7 @@ static int get_port_list(nsid_t nsid, void **out, size_t *out_len)
                 break;
             }
         }
+        rte_rwlock_read_unlock(&port_rwlock[i]);
     }
 
     get->nic_num = cnt;
@@ -4916,32 +3404,9 @@ static int get_port_ext_info(struct netif_port *port, void **out, size_t *out_le
     get->port_id = port->id;
 
     /* dev info */
-    if (is_physical_port( port->id) || is_bond_port(port->id)) {
+    if (is_physical_port( port->id)) {
         rte_eth_dev_info_get(port->id, &dev_info);
         copy_dev_info(&get->dev_info, &dev_info);
-    }
-
-    /* cfg_queues */
-    if (port->type == PORT_TYPE_GENERAL ||
-        port->type == PORT_TYPE_BOND_MASTER) {
-        len = NETIF_CTRL_BUFFER_LEN;
-        err = netif_print_lcore_conf(ctrlbuf, &len, false, port->id);
-        if (unlikely(EDPVS_OK != err))
-            goto errout;
-
-        new = rte_realloc(get, sizeof(netif_nic_ext_get_t) + len + 1, 0);
-        if (unlikely(!new)) {
-            err = EDPVS_NOMEM;
-            goto errout;
-        }
-        get = new;
-
-        get->cfg_queues.data_offset = offset;
-        get->cfg_queues.data_len = len;
-        memcpy(&get->data[offset], ctrlbuf, len);
-        offset += len;
-        get->data[offset] = '\0';
-        offset++;
     }
 
     /* mc_list */
@@ -5044,75 +3509,6 @@ static int get_port_xstats(struct netif_port *port, void **out, size_t *out_len)
     return EDPVS_OK;
 }
 
-static int get_bond_status(struct netif_port *port, void **out, size_t *out_len)
-{
-    bool is_active;
-    int i, j, xmit_policy;
-    portid_t primary;
-    uint16_t slaves[NETIF_MAX_BOND_SLAVES], actives[NETIF_MAX_BOND_SLAVES];
-    struct netif_port *sport, *mport = port;
-    netif_bond_status_get_t *get;
-    assert(out && out_len);
-
-    if (!mport)
-        return EDPVS_NOTEXIST;
-    if (mport->type != PORT_TYPE_BOND_MASTER)
-        return EDPVS_INVAL;
-
-    get = rte_zmalloc(NULL, sizeof(netif_bond_status_get_t),
-            RTE_CACHE_LINE_SIZE);
-    if (unlikely(!get))
-        return EDPVS_NOMEM;
-    get->mode = rte_eth_bond_mode_get(port->id);
-
-    primary = rte_eth_bond_primary_get(port->id);
-    get->slave_nb = rte_eth_bond_members_get(port->id,
-            slaves, NETIF_MAX_BOND_SLAVES);
-    get->active_nb = rte_eth_bond_active_members_get(port->id,
-            actives, NETIF_MAX_BOND_SLAVES);
-    for (i = 0; i < get->slave_nb; i++) {
-        is_active = false;
-        for (j = 0; j < get->active_nb; j++) {
-            if (actives[j] == slaves[i]) {
-                is_active = true;
-                break;
-            }
-        }
-        sport = netif_port_get(slaves[i]);
-        snprintf(get->slaves[i].name, sizeof(get->slaves[i].name),
-                "%s", sport ? sport->name : "UNKOWN");
-        if (is_active)
-            get->slaves[i].is_active = 1;
-        if (slaves[i] == primary)
-            get->slaves[i].is_primary = 1;
-        rte_ether_format_addr(&get->slaves[i].macaddr[0], sizeof(get->slaves[i].macaddr) - 1, &sport->addr);
-    }
-
-    rte_ether_format_addr(get->macaddr, sizeof(get->macaddr), &mport->addr);
-
-    xmit_policy = rte_eth_bond_xmit_policy_get(port->id);
-    switch (xmit_policy) {
-    case BALANCE_XMIT_POLICY_LAYER2:
-        snprintf(get->xmit_policy, sizeof(get->xmit_policy), "LAYER2");
-        break;
-    case BALANCE_XMIT_POLICY_LAYER23:
-        snprintf(get->xmit_policy, sizeof(get->xmit_policy), "LAYER23");
-        break;
-    case BALANCE_XMIT_POLICY_LAYER34:
-        snprintf(get->xmit_policy, sizeof(get->xmit_policy), "LAYER34");
-        break;
-    default:
-        snprintf(get->xmit_policy, sizeof(get->xmit_policy), "UNKOWN");
-    }
-
-    get->link_monitor_interval = rte_eth_bond_link_monitoring_get(port->id);
-    get->link_down_prop_delay = rte_eth_bond_link_down_prop_delay_get(port->id);
-    get->link_up_prop_delay = rte_eth_bond_link_up_prop_delay_get(port->id);
-
-    *out = get;
-    *out_len = sizeof(netif_bond_status_get_t);
-    return EDPVS_OK;
-}
 
 static int netif_sockopt_get(sockoptid_t opt, const void *in, size_t inlen,
                              void **out, size_t *outlen)
@@ -5189,13 +3585,7 @@ static int netif_sockopt_get(sockoptid_t opt, const void *in, size_t inlen,
             ret = get_port_ext_info(port, out, outlen);
             break;
         case SOCKOPT_NETIF_GET_BOND_STATUS:
-            if (!in)
-                return EDPVS_INVAL;
-            name = (char*)in;
-            port = netif_port_get_by_name(name);
-            if (!port)
-                return EDPVS_NOTEXIST;
-            ret = get_bond_status(port, out, outlen);
+            ret = EDPVS_NOTSUPP;
             break;
         case SOCKOPT_NETIF_GET_MADDR:
             if (!in)
@@ -5301,16 +3691,7 @@ static int set_port(struct netif_port *port, const netif_nic_set_t *port_cfg)
             (unsigned *)&ea.addr_bytes[4],
             (unsigned *)&ea.addr_bytes[5]);
     if (rte_is_valid_assigned_ether_addr(&ea)) {
-        if (port->type == PORT_TYPE_BOND_MASTER) {
-            if (rte_eth_bond_mac_address_set(port->id, &ea) < 0) {
-                RTE_LOG(WARNING, NETIF, "fail to set %s's macaddr to be %s\n",
-                        port->name, port_cfg->macaddr);
-            } else {
-                RTE_LOG(INFO, NETIF, "set %s's macaddr to be %s\n",
-                        port->name, port_cfg->macaddr);
-                port->addr = ea;
-            }
-        } else {
+        if (port->type == PORT_TYPE_GENERAL) {
             if (!rte_eth_dev_mac_addr_add(port->id, &ea, 0) &&
                     !rte_eth_dev_default_mac_addr_set(port->id, &ea)) {
                 RTE_LOG(INFO, NETIF, "set %s's macaddr to be %s\n",
@@ -5341,119 +3722,6 @@ static int set_port(struct netif_port *port, const netif_nic_set_t *port_cfg)
     return EDPVS_OK;
 }
 
-static int set_bond(struct netif_port *port, const netif_bond_set_t *bond_cfg)
-{
-    int i, j;
-    assert(bond_cfg);
-    switch (bond_cfg->opt) {
-    case OPT_MODE:
-    {
-        if (!rte_eth_bond_mode_set(port->id, bond_cfg->param.mode)) {
-            RTE_LOG(INFO, NETIF, "%s's mode changed: %d -> %d\n",
-                    port->name, port->bond->master.mode, bond_cfg->param.mode);
-            port->bond->master.mode = bond_cfg->param.mode;
-        }
-        break;
-    }
-    case OPT_SLAVE:
-    {
-        struct netif_port *slave;
-        slave = netif_port_get_by_name(bond_cfg->param.slave);
-        if (!slave)
-            return EDPVS_NOTEXIST;
-        if (bond_cfg->act == ACT_ADD) {
-            if (!rte_eth_bond_member_add(port->id, slave->id)) {
-                RTE_LOG(INFO, NETIF, "slave %s is added to %s\n",
-                        slave->name, port->name);
-                port->bond->master.slaves[port->bond->master.slave_nb++] = slave;
-            }
-        } else if (bond_cfg->act == ACT_DEL) {
-            if (!rte_eth_bond_member_remove(port->id, slave->id)) {
-                RTE_LOG(INFO, NETIF, "slave %s is removed from %s\n",
-                        slave->name, port->name);
-                for (i = 0, j = 0; i < port->bond->master.slave_nb; i++) {
-                    if (port->bond->master.slaves[i]->id == slave->id)
-                        continue;
-                    port->bond->master.slaves[j++] = port->bond->master.slaves[i];
-                }
-                port->bond->master.slave_nb--;
-            }
-        }
-        if (port->netif_ops->op_update_addr) {
-            if (port->netif_ops->op_update_addr(port) != EDPVS_OK)
-                RTE_LOG(ERR, NETIF, "%s: fail to update %s's mac address!\n", __func__, port->name);
-        }
-        break;
-    }
-    case OPT_PRIMARY:
-    {
-        struct netif_port *primary;
-        primary = netif_port_get_by_name(bond_cfg->param.primary);
-        if (!primary)
-            return EDPVS_NOTEXIST;
-        if (!rte_eth_bond_primary_set(port->id, primary->id)) {
-            RTE_LOG(INFO, NETIF, "%s's primary slave changed: %s -> %s\n",
-                    port->name, port->bond->master.primary->name, primary->name);
-            port->bond->master.primary = primary;
-        }
-        if (port->netif_ops->op_update_addr) {
-            if (port->netif_ops->op_update_addr(port) != EDPVS_OK)
-                RTE_LOG(ERR, NETIF, "%s: fail to update %s's mac address!\n", __func__, port->name);
-        }
-        break;
-    }
-    case OPT_XMIT_POLICY:
-    {
-        int xp = -1;
-        if (!strcmp(bond_cfg->param.xmit_policy, "LAYER2") ||
-                !strcmp(bond_cfg->param.xmit_policy, "layer2"))
-            xp = BALANCE_XMIT_POLICY_LAYER2;
-        else if (!strcmp(bond_cfg->param.xmit_policy, "LAYER23") ||
-                !strcmp(bond_cfg->param.xmit_policy, "layer23"))
-            xp = BALANCE_XMIT_POLICY_LAYER23;
-        else if (!strcmp(bond_cfg->param.xmit_policy, "LAYER34") ||
-                !strcmp(bond_cfg->param.xmit_policy, "layer34"))
-            xp = BALANCE_XMIT_POLICY_LAYER34;
-
-        if (xp >=0 && !rte_eth_bond_xmit_policy_set(port->id, xp)) {
-            RTE_LOG(INFO, NETIF, "set %s's xmit-policy to be %s\n",
-                    port->name, bond_cfg->param.xmit_policy);
-        }
-        break;
-    }
-    case OPT_LINK_MONITOR_INTERVAL:
-    {
-        if (!rte_eth_bond_link_monitoring_set(port->id,
-                    bond_cfg->param.link_monitor_interval)) {
-            RTE_LOG(INFO, NETIF, "set %s's link-monitor-interval to be %d ms\n",
-                    port->name, bond_cfg->param.link_monitor_interval);
-        }
-        break;
-    }
-    case OPT_LINK_DOWN_PROP:
-    {
-        if (!rte_eth_bond_link_down_prop_delay_set(port->id,
-                    bond_cfg->param.link_down_prop)) {
-            RTE_LOG(INFO, NETIF, "set %s's link-down-prop to be %d ms\n",
-                    port->name, bond_cfg->param.link_down_prop);
-        }
-        break;
-    }
-    case OPT_LINK_UP_PROP:
-    {
-        if (!rte_eth_bond_link_up_prop_delay_set(port->id,
-                    bond_cfg->param.link_up_prop)) {
-            RTE_LOG(INFO, NETIF, "set %s's link-up-prop to be %d ms\n",
-                    port->name, bond_cfg->param.link_up_prop);
-        }
-        break;
-    }
-    default:
-        return EDPVS_NOTSUPP;
-    }
-    return EDPVS_OK;
-}
-
 static int netif_sockopt_set(sockoptid_t opt, const void *in, size_t inlen)
 {
     int ret;
@@ -5480,14 +3748,7 @@ static int netif_sockopt_set(sockoptid_t opt, const void *in, size_t inlen)
         }
         case SOCKOPT_NETIF_SET_BOND:
         {
-            struct netif_port *port;
-            if (!in || inlen != sizeof(netif_bond_set_t))
-                return EDPVS_INVAL;
-            port = netif_port_get_by_name(((netif_bond_set_t *)in)->name);
-            if (!port || port->type != PORT_TYPE_BOND_MASTER)
-                return EDPVS_INVAL;
-            ret = set_bond(port, in);
-            break;
+          return EDPVS_NOTSUPP; 
         }
         default:
             RTE_LOG(WARNING, NETIF, "[%s] invalid netif set cmd: %d\n", __func__, opt);
@@ -5515,6 +3776,9 @@ int netif_ctrl_init(void)
     int err;
 
     if ((err = lcore_stats_msg_init()) != EDPVS_OK)
+        return err;
+
+    if ((err = netif_msg_init()) != EDPVS_OK)
         return err;
 
     if ((err = sockopt_register(&netif_sockopt)) != EDPVS_OK)

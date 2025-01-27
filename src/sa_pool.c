@@ -155,46 +155,6 @@ static int sa_pool_free_hash(struct sa_pool *ap)
     return EDPVS_OK;
 }
 
-static int sa_pool_add_filter(struct inet_ifaddr *ifa, struct sa_pool *ap,
-                             lcoreid_t cid)
-{
-    int err;
-    struct sa_flow *flow = &sa_flows[cid];
-
-    netif_flow_handler_param_t flow_handlers = {
-            .size     = MAX_SA_FLOW,
-            .flow_num = 0,
-            .handlers = ap->flows,
-    };
-
-    if (!sapool_flow_enable)
-        return EDPVS_OK;
-
-    err = netif_sapool_flow_add(ifa->idev->dev, cid, ifa->af, &ifa->addr,
-            flow->port_base, htons(flow->mask), &flow_handlers);
-    ap->flow_num = flow_handlers.flow_num;
-
-    return err;
-}
-
-static int sa_pool_del_filter(struct inet_ifaddr *ifa, struct sa_pool *ap,
-                               lcoreid_t cid)
-{
-    struct sa_flow *flow = &sa_flows[cid];
-
-    netif_flow_handler_param_t flow_handlers = {
-            .size     = MAX_SA_FLOW,
-            .flow_num = ap->flow_num,
-            .handlers = ap->flows,
-    };
-
-    if (!sapool_flow_enable)
-        return EDPVS_OK;
-
-    return netif_sapool_flow_del(ifa->idev->dev, cid, ifa->af, &ifa->addr,
-            flow->port_base, htons(flow->mask), &flow_handlers);
-}
-
 int sa_pool_create(struct inet_ifaddr *ifa, uint16_t low, uint16_t high)
 {
     int err;
@@ -230,11 +190,6 @@ int sa_pool_create(struct inet_ifaddr *ifa, uint16_t low, uint16_t high)
         goto free_ap;
     }
 
-    err = sa_pool_add_filter(ifa, ap, cid);
-    if (err != EDPVS_OK) {
-        goto free_hash;
-    }
-
     ifa->sa_pool = ap;
 
     /* inc ifa->refcnt to hold it */
@@ -250,8 +205,6 @@ int sa_pool_create(struct inet_ifaddr *ifa, uint16_t low, uint16_t high)
 
     return EDPVS_OK;
 
-free_hash:
-    sa_pool_free_hash(ap);
 free_ap:
     rte_free(ap);
     return err;
@@ -264,7 +217,6 @@ free_ap:
  * */
 int sa_pool_destroy(struct inet_ifaddr *ifa)
 {
-    int err;
     struct sa_pool *ap;
     lcoreid_t cid = rte_lcore_id();
 
@@ -280,13 +232,6 @@ int sa_pool_destroy(struct inet_ifaddr *ifa)
 
     if (!rte_atomic32_dec_and_test(&ap->refcnt))
         return EDPVS_OK;
-
-    err = sa_pool_del_filter(ifa, ap, cid);
-    if (err != EDPVS_OK) {
-        RTE_LOG(ERR, SAPOOL, "[%02d] %s: sa_del_filter failed -- %s\n",
-                cid, __func__, dpvs_strerror(err));
-        return err;
-    }
 
     sa_pool_free_hash(ap);
     rte_free(ap);

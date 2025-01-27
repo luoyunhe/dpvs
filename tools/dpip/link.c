@@ -24,6 +24,8 @@
 #include <getopt.h>
 #include "conf/common.h"
 #include "conf/namespace.h"
+#include "conf/sockopts.h"
+#include "conf/virtio_user.h"
 #include "dpip.h"
 #include "conf/netif.h"
 #include "sockopt.h"
@@ -79,13 +81,13 @@ struct link_param
     int verbose;
     int status;
     int all;
+    int is_virtio;
     link_stats_t stats;
     link_device_t dev_type;
     char dev_name[LINK_DEV_NAME_MAXLEN];
     char item[LINK_ARG_ITEM_MAXLEN]; /* for SET cmd */
     char value[LINK_ARG_VALUE_MAXLEN]; /* for SET cmd */
-    char item2[LINK_ARG_ITEM_MAXLEN];
-    char value2[LINK_ARG_VALUE_MAXLEN];
+    struct virtio_user_param virtio_user_param; 
 };
 
 bool g_color = false;
@@ -138,8 +140,6 @@ static void link_help(void)
             "    ---supported items---\n"
             "    promisc [on|off], forward2kni [on|off], link [up|down], lldp [up|down]\n"
             "    allmulticast [on|off], tc-egress [on|off], tc-ingress [on|off], addr, \n"
-            "    bond-[mode|slave|primary|xmit-policy|monitor-interval|link-up-prop|"
-            "link-down-prop]\n"
 
             "Examples:\n"
             "    dpip link show\n"
@@ -172,6 +172,28 @@ static inline int link_get_cpu_id(const char *name, unsigned *id)
     return 0;
 }
 
+static bool is_valid_name(const char* str) {
+    while (*str) {
+        if (!islower(*str) && !isdigit(*str) && *str != '_' && *str != '-') {
+            return false;
+        }
+        str++;
+    }
+    return true;
+}
+
+static int parse_mac(const char *str, uint8_t *out_mac) {
+    unsigned int mac[6] = { 0 };
+    int i;
+    int ret = sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+        &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+    if (ret != 6)
+        return EDPVS_INVAL;
+    for (i = 0; i < 6; i++)
+        out_mac[i] = mac[i];
+    return EDPVS_OK;
+}
+
 static int link_parse_args(struct dpip_conf *conf,
                            struct link_param *param)
 {
@@ -189,31 +211,54 @@ static int link_parse_args(struct dpip_conf *conf,
             if (strcmp(conf->argv[0], "cpu") != 0)
                 snprintf(param->dev_name, sizeof(param->dev_name), "%s", conf->argv[0]);
         } else if (!strncmp(conf->argv[0], "all", 3)) {
-                param->all = 1;
+            param->all = 1;
+        } else if (!strncmp(conf->argv[0], "virtio", 6)) {
+            param->dev_type = LINK_DEVICE_NIC;
+            param->is_virtio = 1;
         } else {
             param->dev_type = LINK_DEVICE_NIC;
             snprintf(param->dev_name, sizeof(param->dev_name), "%s", conf->argv[0]);
         }
         NEXTARG(conf);
     }
-
     /* parse other params */
     while (conf->argc > 0) {
         if (conf->cmd == DPIP_CMD_SHOW) {
             if (!strncmp(conf->argv[0], "status", 6)) {
                 param->status = 1;
             }
+        } else if (conf->cmd == DPIP_CMD_ADD && param->is_virtio) {
+            if (strncmp(conf->argv[0], "mac", 4) == 0) {
+                NEXTARG_CHECK(conf, param->item);
+                if (EDPVS_OK != parse_mac(conf->argv[0], param->virtio_user_param.mac)) {
+                    fprintf(stderr, "invalid mac: %s\n", conf->argv[0]);
+                    return EDPVS_INVAL;
+                }
+            } else if (strncmp(conf->argv[0], "name", 5) == 0) {
+                NEXTARG_CHECK(conf, param->item);
+                if (!is_valid_name(conf->argv[0]) || 
+                        strlen(conf->argv[0]) >= sizeof(param->virtio_user_param.name)) {
+                    fprintf(stderr, "invalid name: %s\n", conf->argv[0]);
+                    return EDPVS_INVAL;
+                }
+                strncpy(param->virtio_user_param.name, conf->argv[0], sizeof(param->virtio_user_param.name)-1);
+            } else if (strncmp(conf->argv[0], "path", 5) == 0) {
+                NEXTARG_CHECK(conf, param->item);
+                if (strlen(conf->argv[0]) >= sizeof(param->virtio_user_param.path)) {
+                    fprintf(stderr, "invalid path: %s\n", conf->argv[0]);
+                    return EDPVS_INVAL;
+                }
+                strncpy(param->virtio_user_param.path, conf->argv[0], sizeof(param->virtio_user_param.path)-1);
+            } else {
+                fprintf(stderr, "unknown param: %s\n", conf->argv[0]);
+                return EDPVS_INVAL;
+            }
         } else if (conf->cmd == DPIP_CMD_SET ||
-                conf->cmd == DPIP_CMD_ADD ||
                 conf->cmd == DPIP_CMD_DEL) {
             if (!param->item[0]) {
                 snprintf(param->item, sizeof(param->item), "%s", conf->argv[0]);
                 NEXTARG_CHECK(conf, param->item);
                 snprintf(param->value, sizeof(param->value), "%s", conf->argv[0]);
-            } else if (!param->item2[0]) {
-                snprintf(param->item2, sizeof(param->item2), "%s", conf->argv[0]);
-                NEXTARG_CHECK(conf, param->item2);
-                snprintf(param->value2, sizeof(param->value2), "%s", conf->argv[0]);
             }
         }
         NEXTARG(conf);
@@ -497,50 +542,6 @@ static int dump_nic_stats_velocity(char *name, int namelen, int interval, int co
     return EDPVS_OK;
 }
 
-static int dump_bond_status(char *name, int namelen)
-{
-    int i, err;
-    size_t len = 0;
-    netif_bond_status_get_t *p_get = NULL;
-
-    err = dpvs_getsockopt(SOCKOPT_NETIF_GET_BOND_STATUS, name, namelen,
-            (void **)(&p_get), &len);
-    if (err != EDPVS_OK || !p_get || !len)
-        return err;
-    assert(len == sizeof(netif_bond_status_get_t));
-
-    printf("    --- bonding status ---\n");
-    printf("    mode %d mac_addr %s xmit_policy %s link_monitor %dms\n"
-            "    ative/slaves %d/%d link_down_prop_delay %dms"
-            " link_up_prop_delay %dms\n    slaves: ",
-            p_get->mode,
-            p_get->macaddr,
-            p_get->xmit_policy,
-            p_get->link_monitor_interval,
-            p_get->active_nb,
-            p_get->slave_nb,
-            p_get->link_down_prop_delay,
-            p_get->link_up_prop_delay);
-    if (p_get->slave_nb > NETIF_MAX_BOND_SLAVES) {
-        printf("too many slaves: %d\n", p_get->slave_nb);
-        dpvs_sockopt_msg_free(p_get);
-        return EDPVS_INVAL;
-    }
-    for (i = 0; i < p_get->slave_nb; i++) {
-        printf("%s(%s, %s", p_get->slaves[i].name,
-                p_get->slaves[i].macaddr,
-                p_get->slaves[i].is_active ? "active" : "inactive");
-        if (p_get->slaves[i].is_primary)
-            printf(", primary) ");
-        else
-            printf(") ");
-    }
-    printf("\n");
-
-    dpvs_sockopt_msg_free(p_get);
-    return EDPVS_OK;
-}
-
 static int dump_cpu_basic(lcoreid_t cid)
 {
     int err;
@@ -708,11 +709,6 @@ static int link_nic_show(struct link_param *param)
         if ((err = dump_nic_verbose(param->dev_name,
                     sizeof(param->dev_name))) != EDPVS_OK)
             return err;
-    if (param->status) {
-        if ((err = dump_bond_status(param->dev_name,
-                    sizeof(param->dev_name))) != EDPVS_OK)
-            return err;
-    }
     return EDPVS_OK;
 }
 
@@ -997,167 +993,12 @@ static int link_nic_set_lldp(const char *name, const char *value)
     return dpvs_setsockopt(SOCKOPT_NETIF_SET_PORT, &cfg, sizeof(netif_nic_set_t));
 }
 
-static int link_add_virtio(struct link_param *param)
+static int link_add_virtio(struct link_param *link_param)
 {
-    fprintf(stdout, "todo: create virtio link, name %s, vhost pear %s%s%s\n", param->dev_name, param->value,
-        param->value2[0]?", mac ":"", param->value2);
-    return EDPVS_OK;
-}
-
-static int link_bond_add_bond_slave(const char *name, const char *value)
-{
-    netif_bond_set_t cfg;
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    strncpy(cfg.param.slave, value, sizeof(cfg.param.slave) - 1);
-
-    cfg.act = ACT_ADD;
-    cfg.opt = OPT_SLAVE;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_del_bond_slave(const char *name, const char *value)
-{
-    netif_bond_set_t cfg;
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    strncpy(cfg.param.slave, value, sizeof(cfg.param.slave) - 1);
-
-    cfg.act = ACT_DEL;
-    cfg.opt = OPT_SLAVE;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_set_mode(const char *name, const char *value)
-{
-    char *endptr;
-    int mode;
-    netif_bond_set_t cfg;
-
-    assert(value);
-    mode = strtol(value, &endptr, 10);
-    if (*endptr || mode < 0 || mode > 6) {
-        printf("invalid bonding mode: %s\n", value);
-        return EDPVS_INVAL;
-    }
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    cfg.param.mode = mode;
-
-    cfg.act = ACT_SET;
-    cfg.opt = OPT_MODE;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_set_primary(const char *name, const char *value)
-{
-    netif_bond_set_t cfg;
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    strncpy(cfg.param.primary, value, sizeof(cfg.param.primary) - 1);
-
-    cfg.act = ACT_SET;
-    cfg.opt = OPT_PRIMARY;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_set_xmit_policy(const char *name, const char *value)
-{
-    netif_bond_set_t cfg;
-
-    assert(value);
-    if (strcmp(value, "LAYER2") && strcmp(value, "layer2") &&
-            strcmp(value, "LAYER23") && strcmp(value, "layer23") &&
-            strcmp(value, "LAYER34") && strcmp(value, "layer34")) {
-        printf("invalid xmit-poliy: %s\n", value);
-        return EDPVS_INVAL;
-    }
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    strncpy(cfg.param.xmit_policy, value, sizeof(cfg.param.xmit_policy) - 1);
-
-    cfg.act = ACT_SET;
-    cfg.opt = OPT_XMIT_POLICY;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_set_monitor_interval(const char *name, const char *value)
-{
-    char *endptr;
-    int mi;
-    netif_bond_set_t cfg;
-
-    assert(value);
-    mi = strtol(value, &endptr, 10);
-    if (*endptr || mi <= 0) {
-        printf("invalid link_monitor_interval: %s\n", value);
-        return EDPVS_INVAL;
-    }
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    cfg.param.link_monitor_interval = mi;
-
-    cfg.act = ACT_SET;
-    cfg.opt= OPT_LINK_MONITOR_INTERVAL;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_set_link_down_prop(const char *name, const char *value)
-{
-    char *endptr;
-    int ldp;
-    netif_bond_set_t cfg;
-
-    assert(value);
-    ldp = strtol(value, &endptr, 10);
-    if (*endptr || ldp < 0) {
-        printf("invalid link_down_prop: %s\n", value);
-        return EDPVS_INVAL;
-    }
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    cfg.param.link_down_prop = ldp;
-
-    cfg.act = ACT_SET;
-    cfg.opt = OPT_LINK_DOWN_PROP;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
-}
-
-static int link_bond_set_link_up_prop(const char *name, const char *value)
-{
-    char *endptr;
-    int lup;
-    netif_bond_set_t cfg;
-
-    assert(value);
-    lup = strtol(value, &endptr, 10);
-    if (*endptr || lup < 0) {
-        printf("invalid link_up_prop: %s\n", value);
-        return EDPVS_INVAL;
-    }
-
-    memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.name, name, sizeof(cfg.name) - 1);
-    cfg.param.link_up_prop = lup;
-
-    cfg.act = ACT_SET;
-    cfg.opt = OPT_LINK_UP_PROP;
-
-    return dpvs_setsockopt(SOCKOPT_NETIF_SET_BOND, &cfg, sizeof(netif_bond_set_t));
+    struct virtio_user_param *param = &link_param->virtio_user_param;
+    param->nsid = g_nsid;
+    printf("add virtio name %s path %s\n", param->name, param->path);
+    return dpvs_setsockopt(SOCKOPT_SET_VIRTIO_USER_ADD, param, sizeof(*param));
 }
 
 static int link_add(struct link_param *param)
@@ -1167,15 +1008,7 @@ static int link_add(struct link_param *param)
     switch (param->dev_type) {
         case LINK_DEVICE_NIC:
         {
-            if (strcmp(param->item, "bond-slave") == 0)
-                link_bond_add_bond_slave(param->dev_name, param->value);
-            else if (strcmp(param->item, "vhost-peer") == 0 )
-                return link_add_virtio(param);
-            else {
-                fprintf(stderr, "Unexpected add link command.\n");
-                return EDPVS_NOTSUPP;
-            }
-            return EDPVS_OK;
+            return link_add_virtio(param);
         }
         case LINK_DEVICE_CPU:
             return EDPVS_OK;
@@ -1196,8 +1029,6 @@ static int link_del(struct link_param *param)
     switch (param->dev_type) {
         case LINK_DEVICE_NIC:
         {
-            if (strcmp(param->item, "bond-slave") == 0)
-                link_bond_del_bond_slave(param->dev_name, param->value);
             return EDPVS_OK;
         }
         case LINK_DEVICE_CPU:
@@ -1229,18 +1060,6 @@ static int link_set(struct link_param *param)
                 link_nic_set_link_status(param->dev_name, param->value);
             else if (strcmp(param->item, "addr") == 0)
                 link_nic_set_addr(param->dev_name, param->value);
-            else if (strcmp(param->item, "bond-mode") == 0)
-                link_bond_set_mode(param->dev_name, param->value);
-            else if (strcmp(param->item, "bond-primary") == 0)
-                link_bond_set_primary(param->dev_name, param->value);
-            else if (strcmp(param->item, "bond-xmit-policy") == 0)
-                link_bond_set_xmit_policy(param->dev_name, param->value);
-            else if (strcmp(param->item, "bond-monitor-interval") == 0)
-                link_bond_set_monitor_interval(param->dev_name, param->value);
-            else if (strcmp(param->item, "bond-link-down-prop") == 0)
-                link_bond_set_link_down_prop(param->dev_name, param->value);
-            else if (strcmp(param->item, "bond-link-up-prop") == 0)
-                link_bond_set_link_up_prop(param->dev_name, param->value);
             else if (strcmp(param->item, "tc-egress") == 0)
                 link_nic_set_tc_egress(param->dev_name, param->value);
             else if (strcmp(param->item, "tc-ingress") == 0)
@@ -1272,7 +1091,6 @@ static int link_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
     g_color = conf->color;
 
     if (link_parse_args(conf, &param) != EDPVS_OK) {
-        link_help();
         return EDPVS_INVAL;
     }
 

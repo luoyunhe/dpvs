@@ -471,6 +471,7 @@ static int route_flush_msg_cb(struct dpvs_msg *msg)
     struct route_flush_msg *flush_req; 
 
     flush_req = (struct route_flush_msg *)msg->data;
+    pid = flush_req->pid;
     if (pid == NETIF_PORT_ID_INVALID)
         return route_lcore_flush(flush_req->nsid, NULL);
 

@@ -27,7 +27,6 @@
 #include <netinet/udp.h>
 #include "sctp/sctp.h"
 #include "netif.h"
-#include "vlan.h"
 #include "tc/tc.h"
 #include "tc/sch.h"
 #include "tc/cls.h"
@@ -61,7 +60,6 @@ static int match_classify(struct tc_cls *cls, struct rte_mbuf *mbuf,
     __be16 pkt_type = eh->ether_type;
     __be16 sport, dport;
     struct netif_port *idev, *odev;
-    struct vlan_ethhdr *veh;
     int err = TC_ACT_RECLASSIFY; /* by default */
 
     idev = netif_port_get_by_name(m->iifname);
@@ -81,7 +79,6 @@ static int match_classify(struct tc_cls *cls, struct rte_mbuf *mbuf,
     }
 
     /* support IPv4 and 802.1q/IPv4 */
-l2parse:
     switch (ntohs(pkt_type)) {
     case ETH_P_IP:
         if (m->af != AF_INET && m->af != AF_UNSPEC)
@@ -139,13 +136,6 @@ l2parse:
             goto done;
         }
         break;
-
-    case ETH_P_8021Q:
-        veh = (struct vlan_ethhdr *)eh;
-        pkt_type = veh->h_vlan_encapsulated_proto;
-        offset += VLAN_HLEN;
-        goto l2parse;
-
     default:
         goto done;
     }

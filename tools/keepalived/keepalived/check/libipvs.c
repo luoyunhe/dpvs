@@ -384,6 +384,7 @@ static void ipvs_fill_tunnel_conf(ipvs_tunnel_t *tunnel_entry,
     strncpy(conf->link, tunnel_entry->link, sizeof(conf->link));
     conf->iph.saddr = tunnel_entry->laddr.ip;
     conf->iph.daddr = tunnel_entry->raddr.ip;
+    conf->nsid = get_nsid();
     return;
 }
 

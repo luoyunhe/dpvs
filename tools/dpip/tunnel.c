@@ -233,7 +233,7 @@ static int tnl_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
     struct ip_tunnel_param *par_list;
     size_t par_size;
     int err, i;
-
+    param->nsid = g_nsid;
     switch (cmd) {
     case DPIP_CMD_ADD:
         return dpvs_setsockopt(SOCKOPT_TUNNEL_ADD, param, sizeof(*param));

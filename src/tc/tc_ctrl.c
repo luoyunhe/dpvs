@@ -21,8 +21,13 @@
  * Lei Chen <raychen@qiyi.com>, Aug. 2017, initial.
  */
 #include <linux/pkt_sched.h>
+#include "conf/common.h"
+#include "conf/sockopts.h"
 #include "ctrl.h"
+#include "list.h"
 #include "netif.h"
+#include "rte_ether.h"
+#include "rte_malloc.h"
 #include "tc/tc.h"
 #include "tc/cls.h"
 #include "tc/sch.h"
@@ -33,6 +38,11 @@ struct tc_msg_param {
     sockoptid_t operator;
     union tc_param param;
 } __attribute__((__packed__));
+
+static int tc_so_qsch_set(struct netif_port *dev, sockoptid_t oper,
+                         const struct tc_qsch_param *qpar);
+static int tc_so_cls_set(struct netif_port  *dev, sockoptid_t oper,
+                        const struct tc_cls_param *cpar);
 
 static uint32_t tc_msg_seq(void)
 {
@@ -397,6 +407,69 @@ static int tc_cls_get_cb(struct dpvs_msg *msg)
     return EDPVS_OK;
 }
 
+static int cls_flush(struct netif_port *dev, struct Qsch *sch)
+{
+    struct tc_cls *cls, *next;
+    int err;
+    struct tc_cls_param param = {0};
+
+    list_for_each_entry_safe(cls, next, &sch->cls_list, list) {
+        param.sch_id = sch->handle;
+        param.handle = cls->handle;
+        err = tc_so_cls_set(dev, SOCKOPT_TC_DEL, &param);
+        if (err != EDPVS_OK)
+            return err;
+    }
+    return EDPVS_OK;
+}
+
+static int qsch_flush(struct netif_port *dev)
+{
+    struct netif_tc *tc;
+    struct Qsch *sch;
+    struct hlist_node *n;
+    struct tc_qsch_param param = {0};
+    int hash, ret;
+    tc = netif_tc(dev);
+    if (tc->qsch_cnt <= 0) {
+        return EDPVS_OK;
+    }
+    if (tc->qsch_hash) {
+        for (hash = 0; hash < tc->qsch_hash_size; hash++) {
+            hlist_for_each_entry_safe(sch, n, &tc->qsch_hash[hash], hlist) {
+                ret = cls_flush(dev, sch);
+                if (ret != EDPVS_OK)
+                    return ret;
+                param.handle = sch->handle;
+                ret = tc_so_qsch_set(dev, SOCKOPT_TC_DEL, &param);
+                if (ret != EDPVS_OK)
+                    return ret;
+            }
+        }
+    }
+
+    if (tc->qsch) {
+        ret = cls_flush(dev, tc->qsch);
+        if (ret != EDPVS_OK)
+            return ret;
+        param.handle = tc->qsch->handle;
+        ret = tc_so_qsch_set(dev, SOCKOPT_TC_DEL, &param);
+        if (ret != EDPVS_OK)
+            return ret;
+    }
+
+    if (tc->qsch_ingress) {
+        ret = cls_flush(dev, tc->qsch_ingress);
+        if (ret != EDPVS_OK)
+            return ret;
+        param.handle = tc->qsch_ingress->handle;
+        ret = tc_so_qsch_set(dev, SOCKOPT_TC_DEL, &param);
+        if (ret != EDPVS_OK)
+            return ret;
+    }
+    return EDPVS_OK;
+}
+
 static int tc_so_qsch_set(struct netif_port *dev, sockoptid_t oper,
                          const struct tc_qsch_param *qpar)
 {
@@ -411,6 +484,9 @@ static int tc_so_qsch_set(struct netif_port *dev, sockoptid_t oper,
             if (unlikely(!param.handle))
                 return EDPVS_RESOURCE;
         }
+    }
+    if (oper == SOCKOPT_TC_FLUSH) {
+        return qsch_flush(dev);
     }
 
     /* set master lcore */

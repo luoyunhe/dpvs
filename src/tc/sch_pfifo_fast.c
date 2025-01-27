@@ -25,7 +25,6 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include "netif.h"
-#include "vlan.h"
 #include "ipv6.h"
 #include "tc/tc.h"
 #include "conf/tc.h"
@@ -63,7 +62,6 @@ static int pfifo_fast_enqueue(struct Qsch *sch, struct rte_mbuf *mbuf)
     struct rte_ether_hdr *eh = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
     struct iphdr *iph = NULL;
     struct ip6_hdr *ip6h = NULL;
-    struct vlan_ethhdr *veh;
     int offset = sizeof(*eh);
     __be16 pkt_type = eh->ether_type;
 
@@ -75,13 +73,7 @@ static int pfifo_fast_enqueue(struct Qsch *sch, struct rte_mbuf *mbuf)
         return qsch_drop(sch, mbuf);
     }
 
-l2parse:
     switch (ntohs(pkt_type)) {
-    case ETH_P_8021Q:
-        veh = (struct vlan_ethhdr *)eh;
-        pkt_type = veh->h_vlan_encapsulated_proto;
-        offset += VLAN_HLEN;
-        goto l2parse;
     case ETH_P_IP:
         if (unlikely(mbuf_may_pull(mbuf, offset + sizeof(struct iphdr)) != 0))
             break;

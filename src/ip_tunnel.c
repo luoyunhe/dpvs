@@ -171,7 +171,7 @@ static struct netif_port *tunnel_create(struct ip_tunnel_tab *tab,
     if (!strlen(params.ifname))
         snprintf(params.ifname, IFNAMSIZ, "%s%%d", ops->kind);
 
-    dev = netif_alloc(NETIF_PORT_ID_INVALID, ops->priv_size, params.ifname,
+    dev = netif_alloc(par->nsid, NETIF_PORT_ID_INVALID, ops->priv_size, params.ifname,
             1, 1, ops->setup);
     if (!dev)
         return NULL;
@@ -270,7 +270,7 @@ static int tunnel_destroy(struct ip_tunnel_tab *tab, struct netif_port *dev)
         tab->fb_tunnel_dev = NULL;
 
     netif_port_unregister(dev);
-    return netif_free(dev);
+    return netif_free_todo(dev);
 }
 
 /* linux:ip_tunnel_key_match */

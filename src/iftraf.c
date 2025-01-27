@@ -23,7 +23,6 @@
 #include "ipv6.h"
 #include "iftraf.h"
 #include "conf/iftraf.h"
-#include "vlan.h"
 #include "scheduler.h"
 
 #ifndef IFTRAF
@@ -702,17 +701,8 @@ static int iftraf_pkt_deliver(int af, struct rte_mbuf *mbuf, struct netif_port *
             return EDPVS_NOMEM;
         }
 
-        if (dev->type == PORT_TYPE_VLAN) {
-            struct vlan_dev_priv *vlan = netif_priv(dev);
-            struct netif_port *real_dev = vlan->real_dev;
-            RTE_LOG(DEBUG, IFTRAF, "%s: id = %u, ifname = %s, type=%d\n",
-                __func__, real_dev->id,real_dev->name,real_dev->type);
-            devid = real_dev->id;
-            strcpy(pkt->ifname, real_dev->name);
-        } else {
-            devid = mbuf->port;
-            strcpy(pkt->ifname, dev->name);
-        }
+        devid = mbuf->port;
+        strcpy(pkt->ifname, dev->name);
 
         pkt->devid = devid;
         pkt->af = AF_INET;
@@ -765,17 +755,8 @@ static int iftraf_pkt_deliver(int af, struct rte_mbuf *mbuf, struct netif_port *
             return EDPVS_NOMEM;
         }
 
-        if (dev->type == PORT_TYPE_VLAN) {
-            struct vlan_dev_priv *vlan = netif_priv(dev);
-            struct netif_port *real_dev = vlan->real_dev;
-            RTE_LOG(DEBUG, IFTRAF, "%s: id = %u, ifname = %s, type=%d\n",
-                __func__, real_dev->id,real_dev->name,real_dev->type);
-            devid = real_dev->id;
-            strcpy(pkt->ifname, real_dev->name);
-        } else {
-            devid = mbuf->port;
-            strcpy(pkt->ifname, dev->name);
-        }
+        devid = mbuf->port;
+        strcpy(pkt->ifname, dev->name);
 
         pkt->af = AF_INET6;
         pkt->devid = devid;

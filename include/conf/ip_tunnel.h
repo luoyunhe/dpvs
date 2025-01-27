@@ -28,6 +28,8 @@
 #include <net/if.h>
 #include <netinet/ip.h>
 #include <endian.h>
+#include <stdint.h>
+#include "conf/common.h"
 #include "conf/sockopts.h"
 
 #define TNLKINDSIZ              16
@@ -52,6 +54,8 @@ struct ip_tunnel_param {
     char            ifname[IFNAMSIZ];
     char            kind[TNLKINDSIZ];
     char            link[IFNAMSIZ];
+    nsid_t          nsid;
+    uint8_t         nop[3];
     __be16          i_flags;
     __be16          o_flags;
     __be32          i_key;

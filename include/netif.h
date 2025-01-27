@@ -26,6 +26,7 @@
 #include "inetaddr.h"
 #include "netif_addr.h"
 #include "global_data.h"
+#include "rte_build_config.h"
 #include "timer.h"
 #include "tc/tc.h"
 #include "conf/netif.h"
@@ -64,10 +65,6 @@ enum {
 #define NETIF_MAX_BOND_SLAVES       32
 /* maximum number of hw addr */
 #define NETIF_MAX_HWADDR            1024
-/* maximum number of kni device */
-#define NETIF_MAX_KNI               64
-/* maximum number of DPDK rte device */
-#define NETIF_MAX_RTE_PORTS         64
 
 #define NETIF_MAX_ETH_MTU           9000
 #define NETIF_DEFAULT_ETH_MTU       1500
@@ -102,12 +99,9 @@ struct netif_queue_conf
 struct netif_port_conf
 {
     portid_t id;
-    /* rx/tx queues for this lcore to process*/
-    int nrxq;
-    int ntxq;
-    /* rx/tx queue list for this lcore to process */
-    struct netif_queue_conf rxqs[NETIF_MAX_QUEUES];
-    struct netif_queue_conf txqs[NETIF_MAX_QUEUES];
+    nsid_t   nsid;
+    struct netif_queue_conf rxq;
+    struct netif_queue_conf txq;
 } __rte_cache_aligned;
 
 /*
@@ -121,7 +115,7 @@ struct netif_lcore_conf
     /* nic number of this lcore to process */
     int nports;
     /* port list of this lcore to process */
-    struct netif_port_conf pqs[NETIF_MAX_RTE_PORTS];
+    struct netif_port_conf pqs[RTE_MAX_ETHPORTS];
 } __rte_cache_aligned;
 
 /* isolate RX lcore */
@@ -168,9 +162,6 @@ typedef enum {
 /************************ data type for NIC ****************************/
 typedef enum {
     PORT_TYPE_GENERAL,
-    PORT_TYPE_BOND_MASTER,
-    PORT_TYPE_BOND_SLAVE,
-    PORT_TYPE_VLAN,
     PORT_TYPE_TUNNEL,
     PORT_TYPE_INVAL,
 } port_type_t;
@@ -196,27 +187,12 @@ struct netif_kni {
     char                    name[IFNAMSIZ];
 #ifdef CONFIG_KNI_VIRTIO_USER
     struct virtio_kni  *kni;
-#else
-    struct rte_kni          *kni;
 #endif
     struct rte_ether_addr   addr;
     struct dpvs_timer       kni_rtnl_timer;
     int                     kni_rtnl_fd;
     uint8_t                 flags;          // supported: NETIF_PORT_FLAG_RUNNING
     struct rte_ring         *rx_ring;
-    struct list_head        kni_flows;
-} __rte_cache_aligned;
-
-union netif_bond {
-    struct {
-        int mode; /* bonding mode */
-        int slave_nb; /* slave number */
-        struct netif_port *primary; /* primary device */
-        struct netif_port *slaves[NETIF_MAX_BOND_SLAVES]; /* slave devices */
-    } master;
-    struct {
-        struct netif_port *master;
-    } slave;
 } __rte_cache_aligned;
 
 struct netif_ops {
@@ -259,8 +235,6 @@ struct netif_port {
     struct list_head        nlist;                      /* device list node hashed by name */
     struct inet_device      *in_ptr;
     struct netif_kni        kni;                        /* kni device */
-    union netif_bond        *bond;                      /* bonding conf */
-    struct vlan_info        *vlan_info;                 /* VLANs info for real device */
     struct netif_tc         tc[DPVS_MAX_LCORE];         /* traffic control */
     struct netif_ops        *netif_ops;
 } __rte_cache_aligned;
@@ -272,7 +246,6 @@ extern struct rte_mempool *pktmbuf_pool[DPVS_MAX_SOCKET];
 int netif_xmit(struct rte_mbuf *mbuf, struct netif_port *dev);
 int netif_hard_xmit(struct rte_mbuf *mbuf, struct netif_port *dev);
 int netif_rcv(struct netif_port *dev, __be16 eth_type, struct rte_mbuf *mbuf);
-int netif_print_lcore_conf(char *buf, int *len, bool is_all, portid_t pid);
 int netif_print_lcore_queue_conf(lcoreid_t cid, char *buf, int *len, bool title);
 void netif_get_slave_lcores(uint8_t *nb, uint64_t *mask);
 void netif_update_worker_loop_cnt(void);
@@ -295,9 +268,7 @@ struct netif_port* netif_port_get(portid_t id);
 /* get netif by name, fail return NULL */
 struct netif_port* netif_port_get_by_name(const char *name);
 bool is_physical_port(portid_t pid);
-bool is_bond_port(portid_t pid);
 void netif_physical_port_range(portid_t *start, portid_t *end);
-void netif_bond_port_range(portid_t *start, portid_t *end);
 /* port_conf can be NULL for default port configure */
 int netif_print_port_conf(const struct rte_eth_conf *port_conf, char *buf, int *len);
 int netif_print_port_queue_conf(portid_t pid, char *buf, int *len);
@@ -306,22 +277,22 @@ int netif_port_conf_get(struct netif_port *port, struct rte_eth_conf *eth_conf);
 int netif_port_conf_set(struct netif_port *port, const struct rte_eth_conf *conf);
 int netif_port_start(struct netif_port *port); // start nic and wait until up
 int netif_port_stop(struct netif_port *port); // stop nic
-int netif_get_queue(struct netif_port *port, lcoreid_t id, queueid_t *qid);
 int netif_get_link(struct netif_port *dev, struct rte_eth_link *link);
 int netif_get_promisc(struct netif_port *dev, bool *promisc);
 int netif_get_allmulticast(struct netif_port *dev, bool *allmulticast);
 int netif_get_stats(struct netif_port *dev, struct rte_eth_stats *stats);
 int netif_get_xstats(struct netif_port *dev, netif_nic_xstats_get_t **xstats);
-struct netif_port *netif_alloc(portid_t id, size_t priv_size, const char *namefmt,
+struct netif_port *netif_alloc(nsid_t nsid, portid_t id, size_t priv_size, const char *namefmt,
                                unsigned int nrxq, unsigned int ntxq,
                                void (*setup)(struct netif_port *));
 portid_t netif_port_count(void);
 int netif_free(struct netif_port *dev);
+int netif_free_todo(struct netif_port *dev);
 int netif_port_register(struct netif_port *dev);
 int netif_port_unregister(struct netif_port *dev);
+void dpdk_port_setup(struct netif_port *dev);
 
 /************************** module API *****************************/
-int netif_vdevs_add(void);
 int netif_init(void);
 int netif_term(void); /* netif layer cleanup */
 int netif_ctrl_init(void); /* netif ctrl plane init */

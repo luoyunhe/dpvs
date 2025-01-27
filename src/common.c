@@ -65,6 +65,7 @@ const char *dpvs_strerror(int err)
         { EDPVS_PKTSTOLEN,      "stolen packet"},
         { EDPVS_SYSCALL,        "system call failed"},
         { EDPVS_NODEV,          "no such device"},
+        { EDPVS_NS_NOTEXIST,    "namespace not exist"},
 
         { EDPVS_KNICONTINUE,    "kni to continue"},
         { EDPVS_INPROGRESS,     "in progress"},

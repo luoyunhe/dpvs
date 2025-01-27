@@ -37,6 +37,7 @@ enum sockopt_type {
 struct dpvs_sock_msg {
     uint32_t version;
     sockoptid_t id;
+    int fd;
     enum sockopt_type type;
     size_t len;
     char data[0];

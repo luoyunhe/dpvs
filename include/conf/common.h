@@ -132,6 +132,8 @@ enum {
     EDPVS_PKTSTOLEN     = -25,      /* stolen packet */
     EDPVS_SYSCALL       = -26,      /* system call failed */
     EDPVS_NODEV         = -27,      /* no such device */
+    EDPVS_ONGOING       = -28,      /* ongoing */
+    EDPVS_NS_NOTEXIST   = -29,      /* namespace not exist */
 
     /* positive code for non-error */
     EDPVS_KNICONTINUE   = 1,        /* KNI to continue */

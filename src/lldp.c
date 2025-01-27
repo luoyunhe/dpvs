@@ -1457,23 +1457,6 @@ static int lldp_xmit(struct netif_port *dev, bool in_timer)
     rte_memcpy(&ehdr->src_addr, &dev->addr, sizeof(ehdr->src_addr));
     ehdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_LLDP);
 
-    if (dev->type == PORT_TYPE_BOND_SLAVE) {
-        // FIXME:
-        // How to send LLDP packet on a specified slave port? I found no solutions to it via
-        // DPDK API. Maybe changes should be made to bond PMD driver to solve the problem.
-        // So I save the slave port id in mbuf, and hope bond PMD driver may consider it when
-        // distributing mbufs to slave ports.
-        //
-        // Store the slave port id into mbuf->port?
-        // No! mbuf->port is reset to the bond master's port id in the forthcoming transmit process.
-        // Use mbuf->hash.txadapter.reserved2 instead. Hope no conflictions. Remember to reset it to
-        // RTE_MBUF_PORT_INVALID in rte_pktmbuf_alloc.
-        //
-        mbuf->hash.txadapter.reserved2 = dev->id;
-        //MBUF_USERDATA(mbuf, portid_t, MBUF_FIELD_ORIGIN_PORT) = port->id;
-        dev = dev->bond->slave.master;
-    }
-
     return netif_xmit(mbuf, dev);
 
 }
@@ -1590,23 +1573,12 @@ static int lldp_xmit_stop(void)
 static int lldp_rcv(struct rte_mbuf *mbuf, struct netif_port *dev)
 {
     int err;
-    portid_t pid;
     static uint32_t seq = 0;
     struct dpvs_msg *msg;
 
     if (!lldp_enable)
         return EDPVS_KNICONTINUE;
 
-    if (is_bond_port(dev->id)) {
-        pid = MBUF_USERDATA(mbuf, portid_t, MBUF_FIELD_ORIGIN_PORT);
-        dev = netif_port_get(pid);
-        if (unlikely(NULL == dev)) {
-            RTE_LOG(WARNING, LLDP, "%s: fail to find lldp physical device of port id %d\n",
-                    __func__, pid);
-            rte_pktmbuf_free(mbuf);
-            return EDPVS_RESOURCE;
-        }
-    }
     if (!(dev->flag & NETIF_PORT_FLAG_LLDP))
         return EDPVS_KNICONTINUE;
 
@@ -1630,7 +1602,7 @@ static int lldp_rcv(struct rte_mbuf *mbuf, struct netif_port *dev)
 static int lldp_rcv_msg_cb(struct dpvs_msg *msg)
 {
     int err;
-    portid_t pid, start, end;
+    portid_t pid;
     struct netif_port *dev;
     struct rte_mbuf *mbuf;
     void *msgdata = msg->data;
@@ -1638,9 +1610,6 @@ static int lldp_rcv_msg_cb(struct dpvs_msg *msg)
     mbuf = *(struct rte_mbuf **)msgdata;
 
     pid = mbuf->port;
-    netif_bond_port_range(&start, &end);
-    if (pid < end && pid >= start)
-        pid = MBUF_USERDATA(mbuf, portid_t, MBUF_FIELD_ORIGIN_PORT);
 
     dev = netif_port_get(pid);
     if (unlikely(NULL == dev)) {

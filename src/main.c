@@ -37,7 +37,6 @@
 #include "conf/common.h"
 #include "log.h"
 #include "netif.h"
-#include "vlan.h"
 #include "inet.h"
 #include "timer.h"
 #include "ctrl.h"
@@ -54,6 +53,7 @@
 #include "eal_mem.h"
 #include "scheduler.h"
 #include "pdump.h"
+#include "virtio_user.h"
 
 #define DPVS    "dpvs"
 #define RTE_LOGTYPE_DPVS RTE_LOGTYPE_USER1
@@ -82,8 +82,6 @@ static void inline dpdk_version_check(void)
                     cfgfile_init,        cfgfile_term),         \
         DPVS_MODULE(MODULE_PDUMP,        "pdump",               \
                     pdump_init,          pdump_term),           \
-        DPVS_MODULE(MODULE_NETIF_VDEV,  "vdevs",                \
-                    netif_vdevs_add,     NULL),                 \
         DPVS_MODULE(MODULE_TIMER,       "timer",                \
                     dpvs_timer_init,     dpvs_timer_term),      \
         DPVS_MODULE(MODULE_TC,          "tc",                   \
@@ -94,8 +92,6 @@ static void inline dpdk_version_check(void)
                     ctrl_init,           ctrl_term),            \
         DPVS_MODULE(MODULE_TC_CTRL,     "tc_ctrl",              \
                     tc_ctrl_init,        tc_ctrl_term),         \
-        DPVS_MODULE(MODULE_VLAN,        "vlan",                 \
-                    vlan_init,           NULL),                 \
         DPVS_MODULE(MODULE_INET,        "inet",                 \
                     inet_init,           inet_term),            \
         DPVS_MODULE(MODULE_SA_POOL,     "sa_pool",              \
@@ -112,6 +108,10 @@ static void inline dpdk_version_check(void)
                     iftraf_init,         iftraf_term),          \
         DPVS_MODULE(MODULE_EAL_MEM,     "eal_mem",              \
                     eal_mem_init,        eal_mem_term),         \
+        DPVS_MODULE(MODULE_VIRTIO_USER, "virtio_user",          \
+                    virtio_user_init,    virtio_user_term),     \
+        DPVS_MODULE(MODULE_NAMESPACE,   "namespace",            \
+                    namespace_init,      namespace_term),       \
         DPVS_MODULE(MODULE_LAST,        "last",                 \
                     NULL,                NULL)                  \
     }
@@ -281,49 +281,12 @@ static int parse_app_args(int argc, char **argv)
     return ret;
 }
 
-static void add_virtio_dev(void) 
-{
-    char portname[32];
-    char portargs[256];
-    char path[128];
-    int nsid, port_num, i = 0;
-    uint16_t port_id;
-    nsid_init();
-    for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
-        for (port_num = 0; port_num < 2; port_num++) {
-            snprintf(path, sizeof(path), "/tmp/vhost-user-ns%d-p%d", nsid, port_num);
-            snprintf(portname, sizeof(portname), "virtio_user-ns%d-p%d", nsid, port_num);
-            // 创建虚拟设备参数，指定路径，设备名称，mac地址等
-            snprintf(portargs, sizeof(portargs), "path=%s,packed_vq=1,server=1,queues=2,queue_size=1024,mac=00:00:00:00:00:%02x", path, i+1);
-                fprintf(stdout, "add vdev %s\n", portname);
-            remove(path);
-            // 把设备加入到系统
-            if (rte_eal_hotplug_add("vdev", portname, portargs) < 0) {
-                fprintf(stderr, "failed to add vdev %s\n", portname);
-                goto exit;
-            }
-            if (rte_eth_dev_get_port_by_name(portname, &port_id) != 0) {
-                fprintf(stderr, "failed to get port by name %s", portname);
-                goto exit;
-            }
-            nsid_set(port_id, nsid);
-            i++;
-        }
-    }
-    return;
-exit:
-    rte_eal_cleanup();
-    exit(EXIT_FAILURE);
-}
-
 int main(int argc, char *argv[])
 {
     int err, nports;
     portid_t pid;
     struct netif_port *dev;
     struct timeval tv;
-    char pql_conf_buf[LCORE_CONF_BUFFER_LEN];
-    int pql_conf_buf_len = LCORE_CONF_BUFFER_LEN;
 
     dpdk_version_check();
 
@@ -376,8 +339,6 @@ int main(int argc, char *argv[])
 
     rte_timer_subsystem_init();
 
-    add_virtio_dev();
-
     modules_init();
 
     /* config and start all available dpdk ports */
@@ -394,11 +355,6 @@ int main(int argc, char *argv[])
             RTE_LOG(WARNING, DPVS, "Start %s failed, skipping ...\n",
                     dev->name);
     }
-
-    /* print port-queue-lcore relation */
-    netif_print_lcore_conf(pql_conf_buf, &pql_conf_buf_len, true, 0);
-    RTE_LOG(INFO, DPVS, "port-queue-lcore relation array: \n%s\n",
-            pql_conf_buf);
 
     /* start slave worker threads */
     dpvs_lcore_start(0);

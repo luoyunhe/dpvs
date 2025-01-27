@@ -28,7 +28,6 @@
 #define __DPVS_KNI_H__
 #include <stdbool.h>
 #include "netif.h"
-#include "netif_flow.h"
 #include "linux_if.h"
 #include "dpdk.h"
 
@@ -45,7 +44,6 @@ struct kni_addr_flow {
     lcoreid_t kni_worker;
     struct netif_port *dev;
     union inet_addr addr;
-    struct netif_flow_handler flows[MAX_KNI_FLOW];
 };
 
 /*

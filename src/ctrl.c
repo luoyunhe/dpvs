@@ -22,6 +22,7 @@
 #include <libgen.h>
 #include <string.h>
 #include <assert.h>
+#include "conf/common.h"
 #include "ctrl.h"
 #include "netif.h"
 #include "mempool.h"
@@ -1297,6 +1298,7 @@ static inline int sockopt_msg_recv(int clt_fd, struct dpvs_sock_msg **pmsg)
     msg->id = msg_hdr.id;
     msg->type = msg_hdr.type;
     msg->len = msg_hdr.len;
+    msg->fd = clt_fd;
 
     if (msg_hdr.len > 0) {
         res = readn(clt_fd, msg->data, msg->len);
@@ -1353,6 +1355,27 @@ static int sockopt_msg_send(int clt_fd,
     return EDPVS_OK;
 }
 
+int reply_msg(struct dpvs_sock_msg *msg, int ret) {
+    int err;
+    void *reply_data = NULL;
+    size_t reply_data_len = 0;
+    struct dpvs_sock_msg_reply reply_hdr;
+    memset(&reply_hdr, 0, sizeof(reply_hdr));
+    reply_hdr.version = SOCKOPT_VERSION;
+    reply_hdr.id = msg->id;
+    reply_hdr.type = msg->type;
+    reply_hdr.errcode = ret;
+    reply_hdr.len = reply_data_len;
+    err = sockopt_msg_send(msg->fd, &reply_hdr, reply_data, reply_data_len);
+    close(msg->fd);
+    return err;
+}
+
+
+struct dpvs_sock_msg *msg_from_data(const void *data_prt) {
+    return container_of(data_prt, struct dpvs_sock_msg, data);
+}
+
 static int sockopt_ctl(__rte_unused void *arg)
 {
     int clt_fd;
@@ -1390,6 +1413,10 @@ static int sockopt_ctl(__rte_unused void *arg)
             ret = skopt->get(msg->id, msg->data, msg->len, &reply_data, &reply_data_len);
         else if (msg->type == SOCKOPT_SET)
             ret = skopt->set(msg->id, msg->data, msg->len);
+        if (ret == EDPVS_ONGOING) {
+            sockopt_msg_free(msg);
+            return EDPVS_OK;  
+        }
         if (ret < 0) {
             /* assume that reply_data is freed by user when callback fails */
             reply_data = NULL;

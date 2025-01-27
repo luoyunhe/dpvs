@@ -43,7 +43,6 @@
 #define __DPVS_SA_POOL__
 
 #include "conf/common.h"
-#include "netif_flow.h"
 
 #define MAX_PORT            65536
 #define MAX_SA_FLOW         4
@@ -100,9 +99,6 @@ struct sa_pool {
     struct sa_entry_pool        *pool_hash;
     uint8_t                     pool_hash_sz;
     uint32_t                    flags;      /* SA_POOL_F_XXX */
-
-    int                         flow_num;
-    struct netif_flow_handler   flows[MAX_SA_FLOW];
 };
 
 int sa_pool_init(void);
