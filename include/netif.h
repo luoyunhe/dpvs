@@ -110,7 +110,6 @@ struct netif_port_conf
  */
 struct netif_lcore_conf
 {
-    lcoreid_t id;
     enum dpvs_lcore_role_type type;
     /* nic number of this lcore to process */
     int nports;

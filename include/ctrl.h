@@ -57,6 +57,8 @@ typedef enum msg_priority {
 #define DPVS_MSG_F_CALLBACK_FAIL    64
 /* msg timeout */
 #define DPVS_MSG_F_TIMEOUT          128
+/* also send to kni worker */
+#define DPVS_MSG_F_WITH_KNI         256
 
 struct dpvs_msg_reply {
     uint32_t len;

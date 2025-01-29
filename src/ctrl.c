@@ -24,6 +24,7 @@
 #include <assert.h>
 #include "conf/common.h"
 #include "ctrl.h"
+#include "global_data.h"
 #include "netif.h"
 #include "mempool.h"
 #include "parser/parser.h"
@@ -469,7 +470,7 @@ int msg_send(struct dpvs_msg *msg, lcoreid_t cid, uint32_t flags, struct dpvs_ms
         return EDPVS_INVAL;
     add_msg_flags(msg, flags);
 
-    if (unlikely(!((cid == master_lcore) || (slave_lcore_mask & (1L << cid))))) {
+    if (unlikely(!((cid == master_lcore) || (slave_lcore_mask & (1L << cid) || (cid == g_kni_lcore_id))))) {
         RTE_LOG(WARNING, MSGMGR, "%s:msg@%p, invalid args\n", __func__, msg);
         add_msg_flags(msg, DPVS_MSG_F_STATE_DROP);
         return EDPVS_INVAL;
@@ -575,7 +576,8 @@ int multicast_msg_send(struct dpvs_msg *msg, uint32_t flags, struct dpvs_multica
     /* send unicast msgs from master to all alive slaves */
     rte_atomic16_inc(&msg->refcnt);
     for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
-        if (slave_lcore_mask & (1UL << ii)) {
+        if ((slave_lcore_mask & (1UL << ii)) ||
+            ((flags & DPVS_MSG_F_WITH_KNI) && (ii == g_kni_lcore_id))) {
             new_msg = msg_make(msg->type, msg->seq, DPVS_MSG_UNICAST, msg->cid, msg->len, msg->data);
             if (unlikely(!new_msg)) {
                 RTE_LOG(ERR, MSGMGR, "%s:msg@%p, msg make fail\n", __func__, msg);
@@ -610,6 +612,8 @@ int multicast_msg_send(struct dpvs_msg *msg, uint32_t flags, struct dpvs_multica
     mcq->type = msg->type;
     mcq->seq = msg->seq;
     mcq->mask = slave_lcore_mask;
+    if (flags & DPVS_MSG_F_WITH_KNI)
+        mcq->mask |= (1UL << g_kni_lcore_id);
     mcq->org_msg = msg; /* save original msg */
     INIT_LIST_HEAD(&mcq->mq);
 
@@ -1023,6 +1027,10 @@ static inline void slave_lcore_loop_func(__rte_unused void *dummy)
     msg_slave_process(0);
 }
 
+static inline void kni_lcore_loop_func(__rte_unused void *dummy)
+{
+    msg_slave_process(0);
+}
 static struct dpvs_lcore_job msg_master_job = {
     .name = "msg_master_job",
     .type = LCORE_JOB_LOOP,
@@ -1033,6 +1041,12 @@ static struct dpvs_lcore_job msg_slave_job = {
     .name = "msg_slave_job",
     .type = LCORE_JOB_LOOP,
     .func = slave_lcore_loop_func,
+};
+
+static struct dpvs_lcore_job msg_kni_job = {
+    .name = "msg_kni_job",
+    .type = LCORE_JOB_LOOP,
+    .func = kni_lcore_loop_func,
 };
 
 static inline int msg_lcore_job_register(void)
@@ -1048,6 +1062,12 @@ static inline int msg_lcore_job_register(void)
         dpvs_lcore_job_unregister(&msg_master_job, LCORE_ROLE_MASTER);
         return ret;
     }
+    ret = dpvs_lcore_job_register(&msg_kni_job, LCORE_ROLE_KNI_WORKER);
+    if (ret < 0) {
+        dpvs_lcore_job_unregister(&msg_slave_job, LCORE_ROLE_FWD_WORKER);
+        dpvs_lcore_job_unregister(&msg_master_job, LCORE_ROLE_MASTER);
+        return ret;
+    }
 
     return EDPVS_OK;
 }
@@ -1056,6 +1076,7 @@ static inline void msg_lcore_job_unregister(void)
 {
     dpvs_lcore_job_unregister(&msg_master_job, LCORE_ROLE_MASTER);
     dpvs_lcore_job_unregister(&msg_slave_job, LCORE_ROLE_FWD_WORKER);
+    dpvs_lcore_job_unregister(&msg_kni_job, LCORE_ROLE_KNI_WORKER);
 }
 
 static inline int msg_init(void)

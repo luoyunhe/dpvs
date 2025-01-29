@@ -210,7 +210,8 @@ static int virtio_user_add_msg_cb(struct dpvs_msg *msg)
     if (!msg) {
         return EDPVS_NOMEM;
     }
-    ret = multicast_msg_send(msg, DPVS_MSG_F_ASYNC, NULL);
+
+    ret = multicast_msg_send(msg, DPVS_MSG_F_ASYNC|DPVS_MSG_F_WITH_KNI, NULL);
     if (ret != EDPVS_OK) {
         RTE_LOG(INFO, VIRTIO_USER, "[%s] fail to send message, error code = %d\n", __func__, ret);
         msg_destroy(&msg);

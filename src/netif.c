@@ -691,7 +691,7 @@ static struct netif_lcore_stats lcore_stats[DPVS_MAX_LCORE];
 static struct list_head isol_rxq_tab[DPVS_MAX_LCORE];
 
 /* worker configuration array */
-static struct netif_lcore_conf lcore_conf[DPVS_MAX_LCORE + 1];
+static struct netif_lcore_conf lcore_conf[DPVS_MAX_LCORE];
 
 static int isol_rxq_add(lcoreid_t cid, portid_t pid, queueid_t qid,
         unsigned rb_sz, struct netif_queue_conf *rxq);
@@ -701,7 +701,6 @@ static void config_lcores(struct list_head *worker_list)
 {
     int tk;
     int cpu_id_min, cpu_left, cpu_cnt;
-    lcoreid_t id = 0;
     struct worker_conf_stream *worker, *worker_next, *worker_min;
 
     memset(lcore_conf, 0, sizeof(lcore_conf));
@@ -709,6 +708,7 @@ static void config_lcores(struct list_head *worker_list)
     cpu_cnt = cpu_left = list_elems(worker_list);
     list_for_each_entry_safe(worker, worker_next, worker_list, worker_list_node) {
         if (!strcmp(worker->type, "master")) {
+            lcore_conf[worker->cpu_id].type = LCORE_ROLE_MASTER;
             list_move_tail(&worker->worker_list_node, worker_list);
             cpu_left--;
         }
@@ -731,17 +731,11 @@ static void config_lcores(struct list_head *worker_list)
         }
         assert(worker_min != NULL);
 
-        tk = 0;
-        lcore_conf[id].id = worker_min->cpu_id;
         if (!strncmp(worker_min->type, "slave", sizeof("slave")))
-            lcore_conf[id].type = LCORE_ROLE_FWD_WORKER;
+            lcore_conf[worker_min->cpu_id].type = LCORE_ROLE_FWD_WORKER;
         else if (!strncmp(worker_min->type, "kni", sizeof("kni")))
-            lcore_conf[id].type = LCORE_ROLE_KNI_WORKER;
-        else
-            lcore_conf[id].type = LCORE_ROLE_IDLE;
+            lcore_conf[worker_min->cpu_id].type = LCORE_ROLE_KNI_WORKER;
 
-        lcore_conf[id].nports = tk;
-        id++;
 
         list_move_tail(&worker_min->worker_list_node, worker_list);
         cpu_left--;
@@ -749,63 +743,14 @@ static void config_lcores(struct list_head *worker_list)
 }
 
 /* fast searching tables */
-lcoreid_t lcore2index[DPVS_MAX_LCORE+1];
 portid_t port2index[DPVS_MAX_LCORE][NETIF_MAX_PORTS];
-
-static int lcore_index_init(void)
-{
-    lcoreid_t cid;
-    int i;
-
-    for (i = 0; i <= DPVS_MAX_LCORE; i++)
-        lcore2index[i] = DPVS_MAX_LCORE;
-
-    for (i = 0; i <= DPVS_MAX_LCORE; i++) {
-        if (lcore_conf[i].type != LCORE_ROLE_FWD_WORKER)
-            continue;
-        cid = lcore_conf[i].id;
-        if (!rte_lcore_is_enabled(cid))
-            return EDPVS_NONEALCORE;
-        lcore2index[cid] = i;
-    }
-
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-    printf("lcore fast searching table: \n");
-    for (i = 0; i <= DPVS_MAX_LCORE; i++) {
-        if (lcore2index[i] != DPVS_MAX_LCORE)
-            printf("\tcid: %2d --> %2d\n", i, lcore2index[i]);
-    }
-#endif
-
-    return EDPVS_OK;
-}
 
 static void port_index_init(void)
 {
     int ii, jj, tk;
-    lcoreid_t cid;
-    portid_t pid;
     for (ii = 0; ii < DPVS_MAX_LCORE; ii++)
         for (jj = 0; jj < NETIF_MAX_PORTS; jj++)
             port2index[ii][jj] = NETIF_PORT_ID_INVALID;
-
-    for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
-        tk = 0;
-        for (jj = 0; jj < lcore_conf[ii].nports; jj++) {
-            cid = lcore_conf[ii].id;
-            pid = lcore_conf[ii].pqs[jj].id;
-            port2index[cid][pid] = tk++;
-        }
-    }
-#ifdef CONFIG_DPVS_NETIF_DEBUG
-    printf("port fast searching table(port2index[cid][pid]): \n");
-    for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
-        for (jj = 0; jj < NETIF_MAX_PORTS; jj++) {
-            if (port2index[ii][jj] != NETIF_PORT_ID_INVALID)
-                printf("\tcid: %2d, pid: %2d --> index: %2d\n", ii, jj, port2index[ii][jj]);
-        }
-    }
-#endif
 }
 
 void netif_get_slave_lcores(uint8_t *nb, uint64_t *mask)
@@ -819,7 +764,7 @@ void netif_get_slave_lcores(uint8_t *nb, uint64_t *mask)
          * as ports is configured for KNI core. */
         if (lcore_conf[i].type == LCORE_ROLE_FWD_WORKER) {
             slave_lcore_nb++;
-            slave_lcore_mask |= (1L << lcore_conf[i].id);
+            slave_lcore_mask |= (1L << i);
         }
         i++;
     }
@@ -912,11 +857,11 @@ static void lcore_role_init(void)
     g_lcore_role[cid] = LCORE_ROLE_MASTER;
 
     i = 0;
-    while (lcore_conf[i].type) {
-        cid = lcore_conf[i].id;
-        assert(g_lcore_role[cid] == LCORE_ROLE_IDLE);
-        g_lcore_role[cid] = lcore_conf[i].type;
-        i++;
+    for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
+        if (lcore_conf[cid].type == LCORE_ROLE_FWD_WORKER ||
+            lcore_conf[cid].type == LCORE_ROLE_KNI_WORKER) {
+            g_lcore_role[cid] = lcore_conf[cid].type;
+        }
     }
 
     for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
@@ -1099,7 +1044,7 @@ bool netif_lcore_is_fwd_worker(lcoreid_t cid)
     if (cid > DPVS_MAX_LCORE)
         return false;
 
-    return (lcore_conf[lcore2index[cid]].type  ==
+    return (lcore_conf[cid].type  ==
             LCORE_ROLE_FWD_WORKER) ? true : false;
 }
 
@@ -1213,14 +1158,8 @@ int netif_print_lcore_queue_conf(lcoreid_t cid, char *buf, int *len, bool has_ti
     }
 
     i = 0;
-    while (lcore_conf[i].nports > 0) {
-        if (lcore_conf[i].id == cid) {
-            plcore = &lcore_conf[i];
-            break;
-        }
-        ++i;
-    }
-    if (!plcore) {
+    plcore = &lcore_conf[cid];
+    if (!plcore->nports) {
         RTE_LOG(WARNING, NETIF, "[%s] cpu%d has no port-queue configured", __func__, cid);
         return EDPVS_NOTEXIST;
     }
@@ -1309,7 +1248,7 @@ static inline void netif_tx_burst(lcoreid_t cid, portid_t pid)
     struct netif_port *dev = NULL;
 
     assert(cid < DPVS_MAX_LCORE);
-    txq = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].txq;
+    txq = &lcore_conf[cid].pqs[port2index[cid][pid]].txq;
     if (0 == txq->len)
         return;
 
@@ -1339,18 +1278,16 @@ static inline void netif_tx_burst(lcoreid_t cid, portid_t pid)
 /* Call me on MASTER lcore */
 static inline lcoreid_t get_master_xmit_lcore(void)
 {
-    static int i = 0;
-    lcoreid_t cid;
-
-    cid = lcore_conf[i].id;
-    if (netif_lcore_is_fwd_worker(cid)) {
-        i++;
-    } else {
-        cid = lcore_conf[0].id;
-        i = 1;
+    static int cid = 0;
+    while(true) {
+        cid++;
+        if (cid >= DPVS_MAX_LCORE) {
+            cid = 0;
+        }
+        if (g_slave_lcore_mask & (1L << cid)) {
+            return cid;
+        }
     }
-
-    return cid;
 }
 
 struct master_xmit_msg_data {
@@ -1474,7 +1411,7 @@ int netif_hard_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 
     /* port id is determined by routing */
     pid = dev->id;
-    txq = &lcore_conf[lcore2index[cid]].pqs[port2index[cid][pid]].txq;
+    txq = &lcore_conf[cid].pqs[port2index[cid][pid]].txq;
     /* No space left in txq mbufs, transmit cached mbufs immediately */
     if (unlikely(txq->len == NETIF_MAX_PKT_BURST)) {
         netif_tx_burst(cid, pid);
@@ -1768,13 +1705,14 @@ static void lcore_job_recv_fwd(void *arg)
 
     cid = rte_lcore_id();
     assert(DPVS_MAX_LCORE > cid);
-
-    for (i = 0; i < lcore_conf[lcore2index[cid]].nports; i++) {
-        pid = lcore_conf[lcore2index[cid]].pqs[i].id;
+    
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
+    for (i = 0; i < local_lcore_conf->nports; i++) {
+        pid = local_lcore_conf->pqs[i].id;
         assert(pid <= phy_pid_end);
-        nsid = lcore_conf[lcore2index[cid]].pqs[i].nsid;
+        nsid = local_lcore_conf->pqs[i].nsid;
 
-        qconf = &lcore_conf[lcore2index[cid]].pqs[i].rxq;
+        qconf = &local_lcore_conf->pqs[i].rxq;
 
         lcore_process_arp_ring(nsid, cid);
         lcore_process_redirect_ring(cid);
@@ -1783,9 +1721,6 @@ static void lcore_job_recv_fwd(void *arg)
         lcore_stats_burst(&lcore_stats[cid], qconf->len);
 
         lcore_process_packets(qconf->mbufs, cid, qconf->len, 0);
-    }
-    if (unlikely(lcore_conf[lcore2index[cid]].nports == 0)) {
-        usleep(100);
     }
 }
 
@@ -1797,15 +1732,16 @@ static void lcore_job_xmit(void *args)
     struct netif_queue_conf *qconf;
 
     cid = rte_lcore_id();
-    for (i = 0; i < lcore_conf[lcore2index[cid]].nports; i++) {
-        pid = lcore_conf[lcore2index[cid]].pqs[i].id;
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
+    for (i = 0; i < local_lcore_conf->nports; i++) {
+        pid = local_lcore_conf->pqs[i].id;
 #ifdef CONFIG_DPVS_NETIF_DEBUG
         if (unlikely(pid >= dpvs_rte_eth_dev_count())) {
             RTE_LOG(DEBUG, NETIF, "[%s] No enough NICs\n", __func__);
             continue;
         }
 #endif
-        qconf = &lcore_conf[lcore2index[cid]].pqs[i].txq;
+        qconf = &local_lcore_conf->pqs[i].txq;
         if (qconf->len <= 0)
             continue;
         netif_tx_burst(cid, pid);
@@ -1891,11 +1827,6 @@ static void netif_lcore_init(void)
     if ((err = check_lcore_conf(rte_lcore_count(), lcore_conf)) != EDPVS_OK)
         rte_exit(EXIT_FAILURE, "%s: bad lcore configuration (error code: %d),"
                 " exit ...\n", __func__, err);
-
-    /* build lcore fast searching table */
-    if ((err = lcore_index_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "%s: lcore_index_init failed (cause: %s), exit ...\n",
-                __func__, dpvs_strerror(err));
 
     /* build port fast searching table */
     port_index_init();
@@ -2009,10 +1940,12 @@ static void kni_egress(struct netif_port *port)
 static void kni_egress_process(void)
 {
     struct netif_port *dev;
-    portid_t id, total;
-
-    total = netif_port_count();
-    for (id = 0; id < total; id++) {
+    portid_t id;
+    int index;
+    lcoreid_t cid = rte_lcore_id();
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
+    for (index = 0; index < local_lcore_conf->nports; index++) {
+        id = local_lcore_conf->pqs[index].id;
         dev = netif_port_get(id);
         if (!dev)
             continue;
@@ -2032,15 +1965,15 @@ static void kni_ingress_process(void)
     struct rte_mbuf *mbufs[NETIF_MAX_PKT_BURST];
     struct netif_port *dev;
     uint16_t i, pkt_total, pkt_sent;
-    portid_t id, total;
+    portid_t id, index;
     lcoreid_t cid = rte_lcore_id();
 #ifdef CONFIG_KNI_VIRTIO_USER
     struct virtio_kni *virtio_kni;
     static unsigned seq = 0;
 #endif
-
-    total = netif_port_count();
-    for (id = 0; id < total; id++) {
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
+    for (index = 0; index < local_lcore_conf->nports; index++) {
+        id = local_lcore_conf->pqs[index].id;
         dev = netif_port_get(id);
         if (!dev || !kni_dev_running(dev))
             continue;
@@ -3075,13 +3008,27 @@ static inline int lcore_stats_msg_init(void)
     return EDPVS_OK;
 }
 
+static queueid_t get_lcore_queue_id(int cid) {
+    queueid_t qid = 0;
+    int i;
+    for (i = 0; i < DPVS_MAX_LCORE; i++) {
+        if (!(g_slave_lcore_mask & (1UL << i)))
+            continue;
+        if (cid == i) {
+            break;
+        } else {
+            qid++;
+        }
+    }
+    return qid;
+}
+
 static int netif_add_msg_cb(struct dpvs_msg *msg)
 {
     int cid = rte_lcore_id();
     struct netif_port *port = *((struct netif_port**) msg->data);
 
-    int lcore_index = lcore2index[cid];
-    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[lcore_index];
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
     int port_index = local_lcore_conf->nports;
     struct netif_port_conf *new_port = &(local_lcore_conf->pqs[port_index]);
 
@@ -3091,7 +3038,7 @@ static int netif_add_msg_cb(struct dpvs_msg *msg)
     new_port->nsid = port->nsid;
     new_port->rxq.len = 0;
     new_port->rxq.isol_rxq = NULL;
-    new_port->rxq.id = lcore_index;
+    new_port->rxq.id = get_lcore_queue_id(cid);
 
     port2index[cid][port->id] = port_index;
 
@@ -3112,11 +3059,37 @@ static inline int netif_msg_init(void)
     };
 
     for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
-        if (g_slave_lcore_mask & (1L << ii)) {
+        if (g_slave_lcore_mask & (1L << ii) || (ii == g_kni_lcore_id)) {
             lcore_stats_msg_type.cid = ii;
             err = msg_type_register(&lcore_stats_msg_type);
             if (EDPVS_OK != err) {
                 RTE_LOG(WARNING, NETIF, "[%s] fail to register MSG_TYPE_NETIF_ADD msg-type "
+                        "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
+                return err;
+            }
+        }
+    }
+
+    return EDPVS_OK;
+}
+
+static inline int netif_msg_term(void)
+{
+    int ii, err;
+    struct dpvs_msg_type lcore_stats_msg_type = {
+        .type = MSG_TYPE_NETIF_ADD,
+        .mode = DPVS_MSG_UNICAST,
+        .prio = MSG_PRIO_NORM,
+        .unicast_msg_cb = netif_add_msg_cb,
+        .multicast_msg_cb = NULL,
+    };
+
+    for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
+        if (g_slave_lcore_mask & (1L << ii) || (ii == g_kni_lcore_id)) {
+            lcore_stats_msg_type.cid = ii;
+            err = msg_type_unregister(&lcore_stats_msg_type);
+            if (EDPVS_OK != err) {
+                RTE_LOG(WARNING, NETIF, "[%s] fail to unregister MSG_TYPE_NETIF_ADD msg-type "
                         "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
                 return err;
             }
@@ -3798,6 +3771,9 @@ int netif_ctrl_term(void)
         return err;
 
     if ((err = sockopt_unregister(&netif_sockopt)) != EDPVS_OK)
+        return err;
+
+    if ((err = netif_msg_term()) != EDPVS_OK)
         return err;
 
     if ((err = lcore_stats_msg_term()) != EDPVS_OK)
