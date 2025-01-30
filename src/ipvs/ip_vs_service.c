@@ -723,7 +723,7 @@ out:
     return ret;
 }
 
-static int dp_vs_services_flush(lcoreid_t cid, nsid_t nsid)
+int dp_vs_services_flush(lcoreid_t cid, nsid_t nsid)
 {
     int idx;
     struct dp_vs_service *svc, *nxt;

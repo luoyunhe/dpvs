@@ -205,6 +205,7 @@ static int virtio_user_add_msg_cb(struct dpvs_msg *msg)
         return ret;
     }
 
+    netif_add_lcore(port);
     msg = msg_make(MSG_TYPE_NETIF_ADD, 0, DPVS_MSG_MULTICAST,
         rte_lcore_id(), sizeof(struct netif_port*), &port);
     if (!msg) {

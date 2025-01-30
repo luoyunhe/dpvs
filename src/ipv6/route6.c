@@ -321,15 +321,16 @@ int route6_del(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flag
     return __route6_add_del(nsid, dest, plen, flags, gw, dev, src, mtu, false);
 }
 
-int route6_flush(const struct netif_port *dev)
+int route6_flush(nsid_t nsid, const struct netif_port *dev)
 {
     struct dp_vs_route6_conf cf;
 
     memset(&cf, 0, sizeof(cf));
 
     cf.ops = RT6_OPS_FLUSH;
-    strncpy(cf.ifname, dev->name, sizeof(cf.ifname) - 1);
-    cf.nsid = dev->nsid;
+    if (dev)
+        strncpy(cf.ifname, dev->name, sizeof(cf.ifname) - 1);
+    cf.nsid = nsid;
 
     return rt6_add_del_flush(&cf);
 }

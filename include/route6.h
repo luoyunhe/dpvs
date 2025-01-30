@@ -58,7 +58,7 @@ int route6_del(nsid_t nsid, const struct in6_addr *dest, int plen, uint32_t flag
                const struct in6_addr *src, uint32_t mtu);
 
 // Notes: Flush all routes if `port` is NULL.
-int route6_flush(const struct netif_port *dev);
+int route6_flush(nsid_t nsid, const struct netif_port *dev);
 
 /* for route6_xxx.c only */
 void route6_free(struct route6*);

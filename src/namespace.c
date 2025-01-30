@@ -12,8 +12,11 @@
 #include "netif.h"
 #include "ctrl.h"
 #include "dpdk.h"
+#include "route.h"
+#include "route6.h"
 #include "rte_lcore.h"
 #include "rte_malloc.h"
+#include "ipvs/service.h"
 
 #define RTE_LOGTYPE_NAMESPACE       RTE_LOGTYPE_USER1
 
@@ -203,8 +206,18 @@ static int namespace_unregister(struct namespace *ns)
 
 static int namespace_flush_msg_cb(struct dpvs_msg *msg)
 {
+    int ret;
+    lcoreid_t cid = rte_lcore_id();
+    nsid_t nsid = *(nsid_t*)msg->data;
     // todo
-    printf("flush ns in lcore %d\n", rte_lcore_id());
+    printf("flush ns %d in lcore %d\n", nsid, rte_lcore_id());
+    ret = dp_vs_services_flush(cid, nsid);
+    if (ret != EDPVS_OK) {
+        RTE_LOG(ERR, NAMESPACE, "[%s] fail to flush services, error code = %d\n",
+                                __func__, ret);
+        return ret;
+    }
+
     return EDPVS_OK;
 }
 
@@ -248,6 +261,34 @@ static int namespace_sockopt_set(sockoptid_t opt, const void *in, size_t inlen)
             ns = namespace_get_by_name(conf->name);
             if (ns == NULL) {
                 return EDPVS_NOTEXIST;
+            }
+            // flush route
+            ret = route_flush(ns->id, NULL);
+            if (ret != EDPVS_OK) {
+                RTE_LOG(ERR, NAMESPACE, "[%s] fail to flush route, error code = %d\n",
+                                                                      __func__, ret);
+                return ret;
+            }
+            // flush route6
+            ret = route6_flush(ns->id, NULL);
+            if (ret != EDPVS_OK) {
+                RTE_LOG(ERR, NAMESPACE, "[%s] fail to flush route6, error code = %d\n",
+                                                                      __func__, ret);
+                return ret;
+            }
+            // flush ip addr
+            ret = netif_flush_inet_addr_all(ns->id);
+            if (ret != EDPVS_OK) {
+                RTE_LOG(ERR, NAMESPACE, "[%s] fail to flush inet addr, error code = %d\n",
+                                                                      __func__, ret);
+                return ret;
+            }
+
+            ret = dp_vs_services_flush(cid, ns->id);
+            if (ret != EDPVS_OK) {
+                RTE_LOG(ERR, NAMESPACE, "[%s] fail to flush services, error code = %d\n",
+                                                                      __func__, ret);
+                return ret;
             }
 
             msg = msg_make(MSG_TYPE_NAMESPACE_FLUSH, ns_msg_seq(), DPVS_MSG_MULTICAST,

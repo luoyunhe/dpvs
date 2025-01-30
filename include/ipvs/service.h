@@ -118,4 +118,6 @@ struct dp_vs_service *dp_vs_vip_lookup(int af, uint16_t protocol,
                                        lcoreid_t cid, nsid_t nsid);
 void dp_vs_copy_udest_compat(struct dp_vs_dest_conf *udest, dpvs_dest_compat_t *udest_compat);
 
+int dp_vs_services_flush(lcoreid_t cid, nsid_t nsid);
+
 #endif /* __DPVS_SVC_H__ */
