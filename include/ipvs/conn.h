@@ -191,6 +191,8 @@ dp_vs_conn_new(nsid_t nsid, struct rte_mbuf *mbuf,
                uint32_t flags);
 int dp_vs_conn_del(struct dp_vs_conn *conn);
 
+int conn_flush(nsid_t nsid);
+
 struct dp_vs_conn *
 dp_vs_conn_get(nsid_t nsid, int af, uint16_t proto,
                 const union inet_addr *saddr,

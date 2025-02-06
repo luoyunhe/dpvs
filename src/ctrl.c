@@ -15,6 +15,7 @@
  * GNU General Public License for more details.
  *
  */
+#include <stdio.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <sys/un.h>

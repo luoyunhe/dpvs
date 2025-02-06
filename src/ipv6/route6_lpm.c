@@ -487,7 +487,7 @@ static int rt6_lpm_del_lcore(const struct dp_vs_route6_conf *rt6_cfg)
             dump_rt6_prefix(&rt6_cfg->dst, buf, sizeof(buf));
             RTE_LOG(DEBUG, RT6, "[%d] %s(%s via dev %s)->rt6_hash[%d]:rt6_array[%d]:lpm6[%d] OK!"
                     " %d routes left.\n", rte_lcore_id(), __func__, buf, rt6_cfg->ifname,
-                    hashkey, lpm_nexthop, lpm6rt->lpm_nexthop, this_rt6_array->num-1);
+                    hashkey, lpm_nexthop, lpm6rt->lpm_nexthop, this_rt6_array[nsid]->num-1);
 #endif
             list_del(&entry->hnode);
             route6_free((struct route6 *)lpm6rt);

@@ -83,6 +83,15 @@ static RTE_DEFINE_PER_LCORE(uint32_t[DPVS_MAX_NETNS], dp_vs_conn_count);
 
 static uint32_t dp_vs_conn_rnd; /* hash random */
 
+static int conn_flush_msg_cb(struct dpvs_msg *msg);
+static struct dpvs_msg_type conn_msg_type = {
+    .type = MSG_TYPE_CONN_FLUSH,
+    .mode = DPVS_MSG_MULTICAST,
+    .prio = MSG_PRIO_NORM,
+    .unicast_msg_cb = conn_flush_msg_cb,
+    .multicast_msg_cb = NULL,
+};
+
 /*
  * memory pool for dp_vs_conn{}
  */
@@ -730,7 +739,7 @@ void dp_vs_conn_expire_now(struct dp_vs_conn *conn)
     return;
 }
 
-static void conn_flush(nsid_t nsid)
+static void conn_flush_lcore(nsid_t nsid)
 {
     struct conn_tuple_hash *tuphash, *next;
     struct dp_vs_conn *conn;
@@ -804,6 +813,29 @@ static void conn_flush(nsid_t nsid)
     rte_spinlock_unlock(&this_conn_lock);
 #endif
 }
+
+int conn_flush(nsid_t nsid) {
+    int ret = EDPVS_OK;
+    lcoreid_t cid = rte_lcore_id();
+    struct dpvs_msg *msg;
+    msg = msg_make(MSG_TYPE_CONN_FLUSH, 0, DPVS_MSG_MULTICAST,
+            cid, sizeof(nsid_t), &nsid);
+    ret = multicast_msg_send(msg, 0, NULL);
+    if (ret != EDPVS_OK)
+        RTE_LOG(INFO, IPVS, "[%s] fail to send multicast message, error code = %d\n",
+                                __func__, ret);
+    msg_destroy(&msg);
+
+    return ret;
+}
+
+static int conn_flush_msg_cb(struct dpvs_msg *msg)
+{
+    nsid_t nsid = *(nsid_t*)msg->data;
+    conn_flush_lcore(nsid);
+    return EDPVS_OK;
+}
+
 
 struct dp_vs_conn *dp_vs_conn_new(nsid_t nsid, struct rte_mbuf *mbuf,
                                   const struct dp_vs_iphdr *iph,
@@ -1239,7 +1271,7 @@ static int conn_term_lcore(void *arg)
         return EDPVS_DISABLED;
     for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
         if (this_conn_tbl[nsid]) {
-            conn_flush(nsid);
+            conn_flush_lcore(nsid);
             rte_free(this_conn_tbl[nsid]);
             this_conn_tbl[nsid] = NULL;
         }
@@ -1874,6 +1906,12 @@ int dp_vs_conn_init(void)
 
     conn_ctrl_init();
 
+    err = msg_type_mc_register(&conn_msg_type);
+    if (err != EDPVS_OK) {
+        RTE_LOG(ERR, IPVS, "%s: fail to register msg.\n", __func__);
+        return err;
+    }
+
     /* connection cache on each NUMA socket */
     for (i = 0; i < get_numa_nodes(); i++) {
         snprintf(poolname, sizeof(poolname), "dp_vs_conn_%d", i);
@@ -1901,6 +1939,7 @@ cleanup:
 int dp_vs_conn_term(void)
 {
     lcoreid_t lcore;
+    int err;
 
     /* no API opposite to rte_mempool_create() */
 
@@ -1910,6 +1949,12 @@ int dp_vs_conn_term(void)
     }
 
     conn_ctrl_term();
+
+    err = msg_type_mc_unregister(&conn_msg_type);
+    if (err != EDPVS_OK) {
+        RTE_LOG(ERR, IPVS, "%s: fail to register msg.\n", __func__);
+        return err;
+    }
 
     return EDPVS_OK;
 }

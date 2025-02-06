@@ -89,6 +89,33 @@ static void get_virtio_user_name(const char *name, char *out) {
     snprintf(out, 32, "virtio_user-%s", name);
 }
 
+int remove_virtio_user(struct netif_port *port) {
+    int ret;
+    char portname[32];
+    get_virtio_user_name(port->name, portname);
+    ret = netif_port_stop(port);
+    if (ret)
+        RTE_LOG(WARNING, VIRTIO_USER, "[%s] failed to stop port, error code = %d\n", __func__, ret);
+
+    ret = kni_del_dev(port);
+    if (ret)
+        RTE_LOG(WARNING, VIRTIO_USER, "[%s] failed to del kni dev, error code = %d\n", __func__, ret);
+
+    ret = rte_eal_hotplug_remove("vdev", portname);
+    if (ret)
+        RTE_LOG(WARNING, VIRTIO_USER, "[%s] failed to hotplug remove port, error code = %d\n", __func__, ret);
+
+    ret = netif_port_unregister(port);
+    if (ret) {
+        RTE_LOG(ERR, VIRTIO_USER, "[%s] failed to unrigister port, error code = %d\n", __func__, ret);
+        return ret;
+    }
+    netif_free(port);
+
+
+    return EDPVS_OK;
+}
+
 static void* add_virtio_user(void * arg) {
     int ret = EDPVS_OK;
     int ret2 = EDPVS_OK;
@@ -205,22 +232,7 @@ static int virtio_user_add_msg_cb(struct dpvs_msg *msg)
         return ret;
     }
 
-    netif_add_lcore(port);
-    msg = msg_make(MSG_TYPE_NETIF_ADD, 0, DPVS_MSG_MULTICAST,
-        rte_lcore_id(), sizeof(struct netif_port*), &port);
-    if (!msg) {
-        return EDPVS_NOMEM;
-    }
-
-    ret = multicast_msg_send(msg, DPVS_MSG_F_ASYNC|DPVS_MSG_F_WITH_KNI, NULL);
-    if (ret != EDPVS_OK) {
-        RTE_LOG(INFO, VIRTIO_USER, "[%s] fail to send message, error code = %d\n", __func__, ret);
-        msg_destroy(&msg);
-        return ret;
-    }
-    msg_destroy(&msg);
-
-    return EDPVS_OK;
+    return netif_add(port);
 }
 
 

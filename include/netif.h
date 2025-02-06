@@ -290,8 +290,8 @@ int netif_free_todo(struct netif_port *dev);
 int netif_port_register(struct netif_port *dev);
 int netif_port_unregister(struct netif_port *dev);
 void dpdk_port_setup(struct netif_port *dev);
-void netif_flush_lcore(nsid_t nsid);
-void netif_add_lcore(struct netif_port *port);
+int netif_add(struct netif_port *port);
+int netif_port_flush(nsid_t nsid);
 int netif_flush_inet_addr_all(nsid_t nsid);
 
 /************************** module API *****************************/

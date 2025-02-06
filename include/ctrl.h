@@ -223,6 +223,7 @@ int msg_dump(const struct dpvs_msg *msg, char *buf, int len);
 #define MSG_TYPE_VIRTIO_USER_ADD            46
 #define MSG_TYPE_NETIF_ADD                  47
 #define MSG_TYPE_NETIF_FLUSH                48
+#define MSG_TYPE_CONN_FLUSH                 49
 #define MSG_TYPE_IPVS_RANGE_START           100
 
 /* for svc per_core, refer to service.h*/

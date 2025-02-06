@@ -315,7 +315,6 @@ static int rt6_hlist_flush_lcore(const struct dp_vs_route6_conf *cf)
             rte_free(hlist);
         }
     }
-    assert(!flush_all || (flush_all && hlist->nroutes == 0));
 
     return EDPVS_OK;
 }

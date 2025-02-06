@@ -49,6 +49,7 @@
 #include "neigh.h"
 #include "scheduler.h"
 #include "linux_if.h"
+#include "virtio_user.h"
 
 #include <rte_arp.h>
 #include <netinet/in.h>
@@ -2772,6 +2773,81 @@ int netif_port_unregister(struct netif_port *port)
     return EDPVS_OK;
 }
 
+static int netif_seq(void) {
+    static int i = 0;
+    return i++;
+}
+
+static void netif_flush_lcore(nsid_t nsid)
+{
+
+    portid_t pid;
+    int cid = rte_lcore_id();
+    int first_index = 0, second_index = 0;
+
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
+
+    if (local_lcore_conf->nports <= 0) {
+        return;
+    } 
+    for (second_index = 0; second_index < local_lcore_conf->nports; second_index++) {
+        if (local_lcore_conf->pqs[second_index].nsid == nsid) {
+            continue;
+        } else {
+            pid = local_lcore_conf->pqs[second_index].id;
+            port2index[cid][pid] = first_index;
+            rte_memcpy(&local_lcore_conf->pqs[first_index++],
+                        &local_lcore_conf->pqs[second_index],
+                            sizeof(struct netif_lcore_conf));
+        }
+    }
+    local_lcore_conf->nports = first_index;
+}
+
+int netif_port_flush(nsid_t nsid) {
+    int cid = rte_lcore_id();
+    struct dpvs_msg *msg;
+    int i, ret;
+    portid_t pid;
+    struct netif_port *port;
+    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
+    // 删除lcore/kni中的lcore_conf，其他lcore就不会去操作对应的port，如此确保后续删除port操作是安全的
+
+    // flush netif
+    // 此处为同步操作，确保清理动作完成
+    msg = msg_make(MSG_TYPE_NETIF_FLUSH, netif_seq(), DPVS_MSG_MULTICAST, cid, sizeof(nsid_t), &nsid);
+    if (msg == NULL) {
+        return EDPVS_NOMEM;
+    }
+    ret = multicast_msg_send(msg, DPVS_MSG_F_WITH_KNI, NULL);
+    if (ret != EDPVS_OK) {
+        RTE_LOG(INFO, NETIF, "[%s] fail to send multicast message, error code = %d\n", __func__, ret);
+        return ret;
+    }
+
+    // 删除port
+    for (i = 0; i < local_lcore_conf->nports; i++) {
+        if (nsid != local_lcore_conf->pqs->nsid)
+            continue;
+        pid = local_lcore_conf->pqs[i].id;
+        port = netif_port_get(pid);
+        if (!port) {
+            RTE_LOG(WARNING, NETIF, "%s: fail to get port by id %d\n", __func__, pid);
+            continue;
+        }
+        ret = remove_virtio_user(port);
+        if (ret != EDPVS_OK) {
+            RTE_LOG(WARNING, NETIF, "%s: fail to remove port %s\n", __func__, port->name);
+            return ret;
+        }
+    }
+    // 清理master lcore的lcore_conf
+    netif_flush_lcore(nsid);
+
+
+    return EDPVS_OK;
+}
+
 int netif_flush_inet_addr_all(nsid_t nsid)
 {
     lcoreid_t cid = rte_lcore_id();
@@ -3047,31 +3123,7 @@ static queueid_t get_lcore_queue_id(int cid) {
     return qid;
 }
 
-void netif_flush_lcore(nsid_t nsid)
-{
 
-    portid_t pid;
-    int cid = rte_lcore_id();
-    int first_index = 0, second_index = 0;
-
-    struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
-
-    if (local_lcore_conf->nports <= 0) {
-        return;
-    } 
-    for (second_index = 0; second_index < local_lcore_conf->nports; second_index++) {
-        if (local_lcore_conf->pqs[second_index].nsid == nsid) {
-            continue;
-        } else {
-            pid = local_lcore_conf->pqs[second_index].id;
-            port2index[cid][pid] = first_index;
-            rte_memcpy(&local_lcore_conf->pqs[first_index++],
-                        &local_lcore_conf->pqs[second_index],
-                            sizeof(struct netif_lcore_conf));
-        }
-    }
-    local_lcore_conf->nports = first_index;
-}
 
 static int netif_flush_msg_cb(struct dpvs_msg *msg) {
     nsid_t nsid = *(nsid_t *)msg->data;
@@ -3079,7 +3131,7 @@ static int netif_flush_msg_cb(struct dpvs_msg *msg) {
     return EDPVS_OK;
 }
 
-void netif_add_lcore(struct netif_port *port)
+static void netif_add_lcore(struct netif_port *port)
 {
     int cid = rte_lcore_id();
     struct netif_lcore_conf *local_lcore_conf = &lcore_conf[cid];
@@ -3099,6 +3151,25 @@ void netif_add_lcore(struct netif_port *port)
     local_lcore_conf->nports++;
 }
 
+int netif_add(struct netif_port *port) {
+    int ret;
+    struct dpvs_msg *msg;
+
+    netif_add_lcore(port);
+    msg = msg_make(MSG_TYPE_NETIF_ADD, netif_seq(), DPVS_MSG_MULTICAST,
+        rte_lcore_id(), sizeof(struct netif_port*), &port);
+    if (!msg) {
+        return EDPVS_NOMEM;
+    }
+
+    ret = multicast_msg_send(msg, DPVS_MSG_F_ASYNC|DPVS_MSG_F_WITH_KNI, NULL);
+    if (ret != EDPVS_OK) {
+        RTE_LOG(INFO, NETIF, "[%s] fail to send message, error code = %d\n", __func__, ret);
+    }
+    msg_destroy(&msg);
+    return ret;
+}
+
 static int netif_add_msg_cb(struct dpvs_msg *msg)
 {
     struct netif_port *port = *((struct netif_port**) msg->data);
@@ -3112,14 +3183,14 @@ static inline int netif_msg_init(void)
     struct dpvs_msg_type netif_msg_type[2] = {
         {
             .type = MSG_TYPE_NETIF_ADD,
-            .mode = DPVS_MSG_UNICAST,
+            .mode = DPVS_MSG_MULTICAST,
             .prio = MSG_PRIO_NORM,
             .unicast_msg_cb = netif_add_msg_cb,
             .multicast_msg_cb = NULL,
         },
         {
             .type = MSG_TYPE_NETIF_FLUSH,
-            .mode = DPVS_MSG_UNICAST,
+            .mode = DPVS_MSG_MULTICAST,
             .prio = MSG_PRIO_NORM,
             .unicast_msg_cb = netif_flush_msg_cb,
             .multicast_msg_cb = NULL,
@@ -3127,23 +3198,28 @@ static inline int netif_msg_init(void)
 
     };
 
-    for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
-        if (g_slave_lcore_mask & (1L << ii) || (ii == g_kni_lcore_id)) {
-            netif_msg_type[0].cid = ii;
-            netif_msg_type[1].cid = ii;
-            err = msg_type_register(&netif_msg_type[0]);
-            if (EDPVS_OK != err) {
-                RTE_LOG(WARNING, NETIF, "[%s] fail to register msg-type "
-                        "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
-                return err;
-            }
-            err = msg_type_register(&netif_msg_type[1]);
-            if (EDPVS_OK != err) {
-                RTE_LOG(WARNING, NETIF, "[%s] fail to register msg-type "
-                        "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
-                return err;
-            }
-        }
+    netif_msg_type[0].cid = g_kni_lcore_id;
+    err = msg_type_register(&netif_msg_type[0]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to register msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
+    }
+    err = msg_type_mc_register(&netif_msg_type[0]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to register msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
+    }
+
+    netif_msg_type[1].cid = g_kni_lcore_id;
+    err = msg_type_register(&netif_msg_type[1]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to register msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
+    }
+    err = msg_type_mc_register(&netif_msg_type[1]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to register msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
     }
 
     return EDPVS_OK;
@@ -3155,14 +3231,14 @@ static inline int netif_msg_term(void)
     struct dpvs_msg_type netif_msg_type[2] = {
         {
             .type = MSG_TYPE_NETIF_ADD,
-            .mode = DPVS_MSG_UNICAST,
+            .mode = DPVS_MSG_MULTICAST,
             .prio = MSG_PRIO_NORM,
             .unicast_msg_cb = netif_add_msg_cb,
             .multicast_msg_cb = NULL,
         },
         {
             .type = MSG_TYPE_NETIF_FLUSH,
-            .mode = DPVS_MSG_UNICAST,
+            .mode = DPVS_MSG_MULTICAST,
             .prio = MSG_PRIO_NORM,
             .unicast_msg_cb = netif_flush_msg_cb,
             .multicast_msg_cb = NULL,
@@ -3170,23 +3246,28 @@ static inline int netif_msg_term(void)
 
     };
 
-    for (ii = 0; ii < DPVS_MAX_LCORE; ii++) {
-        if (g_slave_lcore_mask & (1L << ii) || (ii == g_kni_lcore_id)) {
-            netif_msg_type[0].cid = ii;
-            netif_msg_type[1].cid = ii;
-            err = msg_type_unregister(&netif_msg_type[0]);
-            if (EDPVS_OK != err) {
-                RTE_LOG(WARNING, NETIF, "[%s] fail to unregister msg-type "
-                        "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
-                return err;
-            }
-            err = msg_type_unregister(&netif_msg_type[1]);
-            if (EDPVS_OK != err) {
-                RTE_LOG(WARNING, NETIF, "[%s] fail to unregister msg-type "
-                        "on lcore%d: %s\n", __func__, ii, dpvs_strerror(err));
-                return err;
-            }
-        }
+    netif_msg_type[0].cid = g_kni_lcore_id;
+    err = msg_type_unregister(&netif_msg_type[0]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to unregister msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
+    }
+    err = msg_type_mc_unregister(&netif_msg_type[0]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to unregister msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
+    }
+
+    netif_msg_type[1].cid = g_kni_lcore_id;
+    err = msg_type_unregister(&netif_msg_type[1]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to unregister msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
+    }
+    err = msg_type_mc_unregister(&netif_msg_type[1]);
+    if (EDPVS_OK != err) {
+        RTE_LOG(WARNING, NETIF, "[%s] fail to unregister msg-type: %s\n", __func__, dpvs_strerror(err));
+        return err;
     }
 
     return EDPVS_OK;

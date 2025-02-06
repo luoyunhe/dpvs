@@ -723,7 +723,7 @@ out:
     return ret;
 }
 
-int dp_vs_services_flush(lcoreid_t cid, nsid_t nsid)
+static int dp_vs_services_flush_lcore(lcoreid_t cid, nsid_t nsid)
 {
     int idx;
     struct dp_vs_service *svc, *nxt;
@@ -895,7 +895,7 @@ static int dp_vs_service_set(sockoptid_t opt, const void *user, size_t len)
     }
 
     if (opt == DPVS_SO_SET_FLUSH)
-        return dp_vs_services_flush(cid, *(nsid_t*)user);
+        return dp_vs_services_flush_lcore(cid, *(nsid_t*)user);
 
     rte_memcpy(arg, user, len);
     usvc_compat = (dpvs_service_compat_t*)arg;
@@ -973,6 +973,12 @@ static int dp_vs_service_set(sockoptid_t opt, const void *user, size_t len)
 
     return ret;
 }
+
+int dp_vs_services_flush(nsid_t nsid)
+{
+    return dp_vs_service_set(DPVS_SO_SET_FLUSH, &nsid, sizeof(nsid_t));
+}
+
 
 /* copy service/dest/stats */
 static int dp_vs_services_copy_percore_stats(dpvs_services_front_t *master_svcs,
@@ -1733,7 +1739,7 @@ int dp_vs_service_term(void)
     int cid, nsid;
     for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
         for (nsid = 0; nsid < DPVS_MAX_NETNS; nsid++) {
-            dp_vs_services_flush(cid, nsid);
+            dp_vs_services_flush_lcore(cid, nsid);
         }
     }
     dp_vs_dest_term();
