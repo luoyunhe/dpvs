@@ -32,6 +32,7 @@
 #include "ctrl.h"
 #include "ndisc.h"
 #include "conf/neigh.h"
+#include "rte_lcore.h"
 #include "scheduler.h"
 #include "mempool.h"
 
@@ -809,6 +810,29 @@ static struct raw_neigh *neigh_ring_clone_param(const struct dp_vs_neigh_conf *p
     return mac_param;
 }
 
+static void del_neigh(nsid_t nsid, struct neighbour_entry *neigh, lcoreid_t cid)
+{
+    struct neighbour_mbuf_entry *mbuf, *mbuf_next;
+    if (!(neigh->flag & NEIGHBOUR_STATIC))
+        dpvs_timer_cancel(&neigh->timer, false);
+    neigh_unhash(neigh);
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+    {
+        char buf[512];
+        dump_neigh_entry(neigh, buf, sizeof(buf));
+        RTE_LOG(INFO, NEIGHBOUR, "%s:[%02d] del neigh entry: %s\n", __func__, cid, buf);
+    }
+#endif
+    list_for_each_entry_safe(mbuf, mbuf_next,
+                        &neigh->queue_list, neigh_mbuf_list) {
+        list_del(&mbuf->neigh_mbuf_list);
+        rte_pktmbuf_free(mbuf->m);
+        dpvs_mempool_put(neigh_mempool, mbuf);
+    }
+    dpvs_mempool_put(neigh_mempool, neigh);
+    neigh_nums[cid][nsid]--;
+}
+
 /*
  *1, master core static neighbour sync slave core;
  *2, ipv6 slave core sync slave core when recieve ns/na
@@ -848,25 +872,7 @@ static void neigh_process_ring(void *arg)
                neigh_send_mbuf_cach(neigh);
            } else {
                if (neigh) {
-                   struct neighbour_mbuf_entry *mbuf, *mbuf_next;
-                   if (!(neigh->flag & NEIGHBOUR_STATIC))
-                       dpvs_timer_cancel(&neigh->timer, false);
-                   neigh_unhash(neigh);
-#ifdef CONFIG_DPVS_NEIGH_DEBUG
-                   {
-                       char buf[512];
-                       dump_neigh_entry(neigh, buf, sizeof(buf));
-                       RTE_LOG(INFO, NEIGHBOUR, "%s:[%02d] del neigh entry: %s\n", __func__, cid, buf);
-                   }
-#endif
-                   list_for_each_entry_safe(mbuf, mbuf_next,
-                                     &neigh->queue_list, neigh_mbuf_list) {
-                       list_del(&mbuf->neigh_mbuf_list);
-                       rte_pktmbuf_free(mbuf->m);
-                       dpvs_mempool_put(neigh_mempool, mbuf);
-                   }
-                   dpvs_mempool_put(neigh_mempool, neigh);
-                   neigh_nums[cid][param->port->nsid]--;
+                   del_neigh(param->port->nsid, neigh, cid);
                } else {
                    RTE_LOG(WARNING, NEIGHBOUR, "%s: not exist\n", __func__);
                }
@@ -875,6 +881,59 @@ cont:
            dpvs_mempool_put(neigh_mempool, param);
        }
     }
+}
+
+static int neigh_seq() {
+    static int i = 0;
+    return i++;
+}
+
+
+
+static int neigh_flush_lcore(nsid_t nsid)
+{
+    struct raw_neigh *params[NETIF_MAX_PKT_BURST];
+    struct neighbour_entry *entry, *next;
+    uint16_t nb_rb = 0;
+    int i, hash;
+    lcoreid_t cid = rte_lcore_id();
+    // 清空neigh ring
+    do {
+        nb_rb = rte_ring_dequeue_burst(neigh_ring[cid], (void **)params,
+                                   NETIF_MAX_PKT_BURST, NULL);
+        for (i = 0; i < nb_rb; i++) {
+            dpvs_mempool_put(neigh_mempool, params[i]);
+        }
+    } while(nb_rb > 0);
+
+    // 清空arp ring
+    flush_arp_ring_lcore(nsid, cid);
+
+    // 清理neigh
+    for (hash = 0; hash < NEIGH_TAB_SIZE; hash++) {
+        list_for_each_entry_safe(entry, next, &neigh_table[cid][nsid][hash], neigh_list) {
+            del_neigh(nsid, entry, cid);
+        }
+    }
+    return EDPVS_OK;
+}
+
+int neigh_flush(nsid_t nsid) {
+    struct dpvs_msg *msg;
+    int ret;
+    msg = msg_make(MSG_TYPE_NEIGH_FLUSH, neigh_seq(), DPVS_MSG_MULTICAST, rte_lcore_id(), sizeof(nsid_t), &nsid);
+    if (msg == NULL) {
+        return EDPVS_NOMEM;
+    }
+
+    // 此处为同步操作，确保清理动作完成
+    ret = multicast_msg_send(msg, 0, NULL);
+    if (ret != EDPVS_OK) {
+        RTE_LOG(ERR, NETIF, "[%s] fail to send multicast message, error code = %d\n", __func__, ret);
+        return ret;
+    }
+
+    return EDPVS_OK;
 }
 
 
@@ -927,6 +986,12 @@ static void neigh_fill_array(nsid_t nsid, struct netif_port *dev, lcoreid_t cid,
             }
         }
     }
+}
+
+static int flush_neigh_uc_cb(struct dpvs_msg *msg)
+{
+    nsid_t nsid = *(nsid_t*)msg->data;
+    return neigh_flush_lcore(nsid);
 }
 
 static int get_neigh_uc_cb(struct dpvs_msg *msg)
@@ -990,7 +1055,7 @@ static int neigh_sockopt_get(sockoptid_t opt, const void *conf,
         memset(get.ifname, 0, sizeof(get.ifname));
 
 
-    msg = msg_make(MSG_TYPE_NEIGH_GET, 0 , DPVS_MSG_MULTICAST, rte_lcore_id(),
+    msg = msg_make(MSG_TYPE_NEIGH_GET, neigh_seq() , DPVS_MSG_MULTICAST, rte_lcore_id(),
                    sizeof(get), &get);
     if (!msg)
         return EDPVS_NOMEM;
@@ -1200,6 +1265,30 @@ static void unregister_stats_cb(void)
     assert(msg_type_mc_unregister(&mt) == 0);
 }
 
+static void register_flush_cb(void)
+{
+    struct dpvs_msg_type mt;
+    memset(&mt, 0 , sizeof(mt));
+    mt.type = MSG_TYPE_NEIGH_FLUSH;
+    mt.prio = MSG_PRIO_NORM;
+    mt.mode = DPVS_MSG_MULTICAST;
+    mt.unicast_msg_cb = flush_neigh_uc_cb;
+    mt.multicast_msg_cb = NULL;
+    assert(msg_type_mc_register(&mt) == 0);
+}
+
+static void unregister_flush_cb(void)
+{
+    struct dpvs_msg_type mt;
+    memset(&mt, 0, sizeof(mt));
+    mt.type = MSG_TYPE_NEIGH_FLUSH;
+    mt.prio = MSG_PRIO_NORM;
+    mt.mode = DPVS_MSG_MULTICAST;
+    mt.unicast_msg_cb = flush_neigh_uc_cb;
+    mt.multicast_msg_cb = NULL;
+    assert(msg_type_mc_unregister(&mt) == 0);
+}
+
 int neigh_init(void)
 {
     /* mempool for "neighbour_entry"(128 bytes), "raw_neigh"(64 byte) and
@@ -1213,6 +1302,7 @@ int neigh_init(void)
     }
 
     register_stats_cb();
+    register_flush_cb();
 
     return arp_init();
 }
@@ -1222,6 +1312,7 @@ int neigh_term(void)
     int i;
 
     unregister_stats_cb();
+    unregister_flush_cb();
 
     for (i = 0; i < NELEMS(neigh_jobs); i++)
         dpvs_lcore_job_unregister(&neigh_jobs[i].job, neigh_jobs[i].role);

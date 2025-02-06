@@ -40,6 +40,7 @@
 #include <rte_mempool.h>
 #include <rte_byteorder.h>
 
+#include "conf/common.h"
 #include "list.h"
 #include "timer.h"
 #include "netif.h"
@@ -116,6 +117,8 @@ int neigh_resolve_input(struct rte_mbuf *mbuf, struct netif_port *port);
 void neigh_confirm(int af, union inet_addr *nexthop, struct netif_port *port);
 
 int neigh_sync_core(const void *param, bool add_del, enum param_kind kind);
+
+int neigh_flush(nsid_t nsid);
 
 static inline void ipv6_mac_mult(const struct in6_addr *mult_target,
                                  struct rte_ether_addr *mult_eth)

@@ -2804,6 +2804,19 @@ static void netif_flush_lcore(nsid_t nsid)
     local_lcore_conf->nports = first_index;
 }
 
+void flush_arp_ring_lcore(nsid_t nsid, lcoreid_t cid)
+{
+    struct rte_mbuf *mbufs[NETIF_MAX_PKT_BURST];
+    uint16_t nb_rb;
+    int i;
+    do {
+        nb_rb = rte_ring_dequeue_burst(arp_ring[nsid][cid], (void**)mbufs, NETIF_MAX_PKT_BURST, NULL);
+        for (i = 0; i < nb_rb; i++) {
+            rte_pktmbuf_free(mbufs[i]);
+        }
+    } while (nb_rb > 0);
+}
+
 int netif_port_flush(nsid_t nsid) {
     int cid = rte_lcore_id();
     struct dpvs_msg *msg;
@@ -2814,20 +2827,27 @@ int netif_port_flush(nsid_t nsid) {
     // 删除lcore/kni中的lcore_conf，其他lcore就不会去操作对应的port，如此确保后续删除port操作是安全的
 
     // flush netif
-    // 此处为同步操作，确保清理动作完成
     msg = msg_make(MSG_TYPE_NETIF_FLUSH, netif_seq(), DPVS_MSG_MULTICAST, cid, sizeof(nsid_t), &nsid);
     if (msg == NULL) {
         return EDPVS_NOMEM;
     }
+    // 此处为同步操作，确保清理动作完成
     ret = multicast_msg_send(msg, DPVS_MSG_F_WITH_KNI, NULL);
     if (ret != EDPVS_OK) {
-        RTE_LOG(INFO, NETIF, "[%s] fail to send multicast message, error code = %d\n", __func__, ret);
+        RTE_LOG(ERR, NETIF, "[%s] fail to send multicast message, error code = %d\n", __func__, ret);
+        return ret;
+    }
+
+    // flush neigh
+    ret = neigh_flush(nsid);
+    if (ret != EDPVS_OK) {
+        RTE_LOG(ERR, NETIF, "[%s] fail to flush conn, error code = %d\n", __func__, ret);
         return ret;
     }
 
     // 删除port
     for (i = 0; i < local_lcore_conf->nports; i++) {
-        if (nsid != local_lcore_conf->pqs->nsid)
+        if (nsid != local_lcore_conf->pqs[i].nsid)
             continue;
         pid = local_lcore_conf->pqs[i].id;
         port = netif_port_get(pid);
@@ -2856,7 +2876,7 @@ int netif_flush_inet_addr_all(nsid_t nsid)
     portid_t pid;
     struct netif_port *port;
     for (i = 0; i < local_lcore_conf->nports; i++) {
-        if (nsid != local_lcore_conf->pqs->nsid)
+        if (nsid != local_lcore_conf->pqs[i].nsid)
             continue;
         pid = local_lcore_conf->pqs[i].id;
         port = netif_port_get(pid);

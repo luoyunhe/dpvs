@@ -293,6 +293,7 @@ void dpdk_port_setup(struct netif_port *dev);
 int netif_add(struct netif_port *port);
 int netif_port_flush(nsid_t nsid);
 int netif_flush_inet_addr_all(nsid_t nsid);
+void flush_arp_ring_lcore(nsid_t nsid, lcoreid_t cid);
 
 /************************** module API *****************************/
 int netif_init(void);
